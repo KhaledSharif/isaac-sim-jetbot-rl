@@ -6,6 +6,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 
 - **Keyboard Teleoperation**: Control the Jetbot using WASD keys
 - **Rich Terminal UI**: Real-time robot state display with visual feedback
+- **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **RL Training Pipeline**: Train PPO agents with optional behavioral cloning warmstart
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
@@ -40,6 +41,12 @@ pip install stable-baselines3 tensorboard gymnasium imitation
 
 ```bash
 ./run.sh --enable-recording
+```
+
+### With Custom Obstacle Count
+
+```bash
+./run.sh --num-obstacles 10
 ```
 
 ### Train RL Agent
@@ -96,14 +103,17 @@ isaac-sim-jetbot-keyboard/
 ### Teleoperation
 
 ```bash
-# Basic teleoperation
+# Basic teleoperation (5 obstacles by default)
 ./run.sh
+
+# With custom obstacle count
+./run.sh --num-obstacles 10
 
 # With recording enabled
 ./run.sh --enable-recording
 
-# Specify demo save path
-./run.sh --enable-recording --demo-path demos/my_demo.npz
+# Combine options
+./run.sh --enable-recording --num-obstacles 8 --demo-path demos/my_demo.npz
 ```
 
 ### Training
@@ -204,8 +214,18 @@ tensorboard --logdir runs/
 - **JetbotKeyboardController**: Main application with keyboard input and Rich TUI
 - **JetbotNavigationEnv**: Gymnasium-compatible RL environment
 - **DifferentialController**: Converts velocity commands to wheel speeds
-- **SceneManager**: Manages goal markers and scene objects
+- **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations
+
+### Obstacle System
+
+The SceneManager randomly spawns static obstacles (FixedCuboid, FixedCylinder, FixedSphere, FixedCapsule) with:
+- **Configurable count**: Set via `--num-obstacles` parameter (default: 5)
+- **Random shapes**: Mix of boxes, cylinders, spheres, and capsules
+- **Random sizes**: Varied dimensions for each obstacle type
+- **Safe placement**: Maintains minimum distance from goal (0.5m) and robot start (1.0m)
+- **Automatic respawn**: Obstacles regenerate when goal is reset (pressing 'G' or new episode)
+- **Varied colors**: Gray, brown, and blue-gray tones to contrast with orange goal marker
 
 ### Isaac Sim Integration
 

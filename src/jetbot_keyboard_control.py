@@ -342,30 +342,47 @@ class SceneManager:
         'y': [-2.0, 2.0],
     }
 
-    def __init__(self, world, workspace_bounds: dict = None):
+    def __init__(self, world, workspace_bounds: dict = None, num_obstacles: int = 5):
         """Initialize the SceneManager.
 
         Args:
             world: The Isaac Sim World object
             workspace_bounds: Optional dict with 'x', 'y' keys, each containing
                              [min, max] bounds for random position generation
+            num_obstacles: Number of obstacles to spawn (default: 5)
         """
         self.world = world
         self.goal_marker = None
         self.goal_position = None
         self.workspace_bounds = workspace_bounds or self.DEFAULT_WORKSPACE_BOUNDS.copy()
         self.goal_counter = 0
+        self.obstacles = []
+        self.obstacle_counter = 0
+        self.num_obstacles = num_obstacles
 
-    def spawn_goal_marker(self, position: list = None, color: tuple = (0, 1, 0, 0.5)) -> np.ndarray:
+    def spawn_goal_marker(self, position: list = None, color: tuple = (1.0, 0.5, 0.0, 1.0)) -> np.ndarray:
         """Spawn a visual goal marker in the scene.
+
+        Deletes the previous goal marker before spawning a new one to ensure
+        only one goal marker exists at a time.
 
         Args:
             position: [x, y, z] position. If None, uses random position.
-            color: RGBA tuple (default semi-transparent green)
+            color: RGBA tuple (default orange)
 
         Returns:
             The goal position as numpy array
         """
+        # Delete old goal marker if it exists
+        if self.goal_marker is not None:
+            try:
+                # Try to remove from scene
+                self.world.scene.remove_object(self.goal_marker.name)
+            except (AttributeError, Exception):
+                # If removal fails, just continue - the new marker will replace it
+                pass
+            self.goal_marker = None
+
         if position is None:
             position = self._random_position()
 
@@ -376,13 +393,18 @@ class SceneManager:
 
         # Try to use real Isaac Sim primitives
         try:
-            from isaacsim.core.api.objects import VisualCuboid
+            from isaacsim.core.api.objects import VisualCone
+            # Adjust position to place cone base on ground
+            cone_position = self.goal_position.copy()
+            cone_position[2] = 0.15  # Half the height of the cone
+
             self.goal_marker = self.world.scene.add(
-                VisualCuboid(
+                VisualCone(
                     prim_path=prim_path,
                     name=f"goal_marker_{self.goal_counter:03d}",
-                    position=self.goal_position,
-                    scale=np.array([0.15, 0.15, 0.02]),  # Flat marker on ground
+                    position=cone_position,
+                    radius=0.15,  # Base radius
+                    height=0.3,   # Cone height
                     color=np.array(color[:3])
                 )
             )
@@ -394,6 +416,9 @@ class SceneManager:
                 'color': color
             })()
             self.goal_marker = self.world.scene.add(marker_mock)
+
+        # Respawn obstacles after goal is set
+        self.spawn_obstacles()
 
         return self.goal_position
 
@@ -431,6 +456,143 @@ class SceneManager:
         distance = np.linalg.norm(robot_pos_2d - goal_pos_2d)
 
         return distance < threshold
+
+    def clear_obstacles(self) -> None:
+        """Clear all obstacles from the scene."""
+        for obstacle in self.obstacles:
+            try:
+                self.world.scene.remove_object(obstacle.name)
+            except (AttributeError, Exception):
+                pass
+        self.obstacles = []
+
+    def _generate_safe_position(self, min_distance_from_goal: float = 0.5,
+                                min_distance_from_start: float = 1.0) -> list:
+        """Generate a random position that is safe (not too close to goal or start).
+
+        Args:
+            min_distance_from_goal: Minimum distance from goal position (meters)
+            min_distance_from_start: Minimum distance from robot start position (meters)
+
+        Returns:
+            [x, y, z] position list that is safe
+        """
+        robot_start = np.array([0.0, 0.0])  # Robot starts at origin
+        max_attempts = 50
+
+        for _ in range(max_attempts):
+            pos = self._random_position()
+            pos_2d = np.array(pos[:2])
+
+            # Check distance from goal
+            if self.goal_position is not None:
+                goal_2d = self.goal_position[:2]
+                if np.linalg.norm(pos_2d - goal_2d) < min_distance_from_goal:
+                    continue
+
+            # Check distance from robot start
+            if np.linalg.norm(pos_2d - robot_start) < min_distance_from_start:
+                continue
+
+            return pos
+
+        # If we couldn't find a valid position, return a random one anyway
+        return self._random_position()
+
+    def spawn_obstacles(self, num_obstacles: int = None) -> None:
+        """Spawn random obstacles in the scene.
+
+        Args:
+            num_obstacles: Number of obstacles to spawn. If None, uses self.num_obstacles
+        """
+        # Clear existing obstacles first
+        self.clear_obstacles()
+
+        if num_obstacles is None:
+            num_obstacles = self.num_obstacles
+
+        # Color palette for obstacles (grays, browns, blue-grays)
+        colors = [
+            np.array([0.5, 0.5, 0.5]),    # Gray
+            np.array([0.6, 0.4, 0.2]),    # Brown
+            np.array([0.4, 0.5, 0.6]),    # Blue-gray
+            np.array([0.3, 0.3, 0.3]),    # Dark gray
+            np.array([0.7, 0.7, 0.7]),    # Light gray
+        ]
+
+        # Try to import Isaac Sim shapes
+        try:
+            from isaacsim.core.api.objects import (
+                FixedCuboid, FixedCylinder, FixedSphere, FixedCapsule
+            )
+
+            for i in range(num_obstacles):
+                self.obstacle_counter += 1
+                prim_path = f"/World/Obstacle_{self.obstacle_counter:03d}"
+                name = f"obstacle_{self.obstacle_counter:03d}"
+
+                # Generate safe position
+                position = self._generate_safe_position()
+
+                # Randomly select shape and color
+                shape_type = np.random.choice(['cuboid', 'cylinder', 'sphere', 'capsule'])
+                color = colors[np.random.randint(0, len(colors))]
+
+                # Create obstacle based on shape type
+                if shape_type == 'cuboid':
+                    size = np.random.uniform(0.15, 0.3)
+                    obstacle = self.world.scene.add(
+                        FixedCuboid(
+                            prim_path=prim_path,
+                            name=name,
+                            position=np.array(position) + np.array([0, 0, size/2]),  # Adjust for base
+                            size=size,
+                            color=color
+                        )
+                    )
+                elif shape_type == 'cylinder':
+                    radius = np.random.uniform(0.08, 0.15)
+                    height = np.random.uniform(0.2, 0.5)
+                    obstacle = self.world.scene.add(
+                        FixedCylinder(
+                            prim_path=prim_path,
+                            name=name,
+                            position=np.array(position) + np.array([0, 0, height/2]),  # Adjust for base
+                            radius=radius,
+                            height=height,
+                            color=color
+                        )
+                    )
+                elif shape_type == 'sphere':
+                    radius = np.random.uniform(0.1, 0.2)
+                    obstacle = self.world.scene.add(
+                        FixedSphere(
+                            prim_path=prim_path,
+                            name=name,
+                            position=np.array(position) + np.array([0, 0, radius]),  # Adjust for base
+                            radius=radius,
+                            color=color
+                        )
+                    )
+                else:  # capsule
+                    radius = np.random.uniform(0.08, 0.12)
+                    height = np.random.uniform(0.2, 0.4)
+                    obstacle = self.world.scene.add(
+                        FixedCapsule(
+                            prim_path=prim_path,
+                            name=name,
+                            position=np.array(position) + np.array([0, 0, height/2 + radius]),  # Adjust for base
+                            radius=radius,
+                            height=height,
+                            color=color
+                        )
+                    )
+
+                self.obstacles.append(obstacle)
+
+        except ImportError:
+            # Fall back to no obstacles for testing
+            pass
 
     def _random_position(self) -> list:
         """Generate a random position within workspace bounds.
@@ -892,13 +1054,14 @@ class JetbotKeyboardController:
     START_ORIENTATION = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion (w, x, y, z)
 
     def __init__(self, enable_recording: bool = False, demo_path: str = None,
-                 reward_mode: str = "dense"):
+                 reward_mode: str = "dense", num_obstacles: int = 5):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
             enable_recording: Enable demonstration recording mode
             demo_path: Path to save demonstrations (auto-generated with timestamp if None)
             reward_mode: Reward computation mode ('dense' or 'sparse')
+            num_obstacles: Number of obstacles to spawn (default: 5)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
@@ -990,8 +1153,8 @@ class JetbotKeyboardController:
         self.checkpoint_flash_frames = 0
         self.checkpoint_flash_duration = 10
 
-        # Initialize scene manager for goal spawning
-        self.scene_manager = SceneManager(self.world)
+        # Initialize scene manager for goal spawning and obstacles
+        self.scene_manager = SceneManager(self.world, num_obstacles=num_obstacles)
 
         # Initialize recording components if enabled
         if self.enable_recording:
@@ -1444,6 +1607,10 @@ def parse_args():
         choices=['dense', 'sparse'],
         help='Reward computation mode (default: dense)'
     )
+    parser.add_argument(
+        '--num-obstacles', type=int, default=5,
+        help='Number of obstacles to spawn (default: 5)'
+    )
     return parser.parse_args()
 
 
@@ -1452,6 +1619,7 @@ if __name__ == "__main__":
     controller = JetbotKeyboardController(
         enable_recording=args.enable_recording,
         demo_path=args.demo_path,
-        reward_mode=args.reward_mode
+        reward_mode=args.reward_mode,
+        num_obstacles=args.num_obstacles
     )
     controller.run()

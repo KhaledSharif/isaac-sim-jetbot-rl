@@ -92,6 +92,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         render_mode: str = 'human',
         headless: bool = False,
         goal_threshold: float = 0.15,
+        num_obstacles: int = 5,
     ):
         """Initialize the Jetbot navigation environment.
 
@@ -102,6 +103,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             render_mode: Render mode ('human' for always rendering)
             headless: If True, run simulation without GUI (faster for training)
             goal_threshold: Distance threshold for considering goal reached
+            num_obstacles: Number of obstacles to spawn (default: 5)
         """
         super().__init__()
 
@@ -112,6 +114,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.render_mode = render_mode
         self.headless = headless
         self.goal_threshold = goal_threshold
+        self.num_obstacles = num_obstacles
 
         # Define observation and action spaces
         self.observation_space = spaces.Box(
@@ -134,7 +137,11 @@ class JetbotNavigationEnv(gymnasium.Env):
         # Initialize helper components
         self.obs_builder = ObservationBuilder()
         self.reward_computer = RewardComputer(mode=reward_mode)
-        self.scene_manager = SceneManager(self.world, workspace_bounds=self.workspace_bounds)
+        self.scene_manager = SceneManager(
+            self.world,
+            workspace_bounds=self.workspace_bounds,
+            num_obstacles=self.num_obstacles
+        )
 
         # Spawn initial goal marker
         self.scene_manager.spawn_goal_marker()
