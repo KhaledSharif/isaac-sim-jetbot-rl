@@ -37,6 +37,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **ActionMapper**: Maps keyboard keys to velocity commands
 - **ObservationBuilder**: Builds observation vectors from robot state
 - **RewardComputer**: Computes navigation rewards
+- **CameraStreamer**: GStreamer H264 RTP UDP camera streaming (`src/camera_streamer.py`)
 
 ## Keyboard Controls
 
@@ -47,6 +48,9 @@ Movement:
   A - Turn left
   D - Turn right
   Space - Stop (emergency brake)
+
+Camera:
+  C - Toggle camera viewer (starts/stops streaming)
 
 Recording:
   ` (backtick) - Toggle recording
@@ -82,8 +86,14 @@ System:
 ## Running the Project
 
 ```bash
-# Teleoperation
+# Teleoperation (camera streaming enabled by default)
 ./run.sh
+
+# Disable camera streaming
+./run.sh --no-camera
+
+# Custom camera port
+./run.sh --camera-port 5601
 
 # With recording enabled
 ./run.sh --enable-recording
@@ -104,6 +114,7 @@ System:
 isaac-sim-jetbot-keyboard/
 ├── src/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
+│   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
 │   ├── eval_policy.py                # Policy evaluation
@@ -140,6 +151,10 @@ Tests use pytest with mocked Isaac Sim imports:
 - pynput (keyboard input)
 - rich (terminal UI)
 - numpy
+
+Optional for camera streaming:
+- GStreamer 1.0 and plugins (gstreamer1.0-tools, gstreamer1.0-plugins-base/good/bad, gstreamer1.0-libav)
+- PyGObject (python3-gi)
 
 Optional for RL:
 - stable-baselines3

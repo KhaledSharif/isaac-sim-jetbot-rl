@@ -6,6 +6,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 
 - **Keyboard Teleoperation**: Control the Jetbot using WASD keys
 - **Rich Terminal UI**: Real-time robot state display with visual feedback
+- **Camera Streaming**: GStreamer H264 RTP UDP streaming from Jetbot camera
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **RL Training Pipeline**: Train PPO agents with optional behavioral cloning warmstart
@@ -19,14 +20,23 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 
 ### Python Dependencies
 
-Core (included with Isaac Sim):
-- numpy
-- pynput
-- rich
-
-Optional for RL training:
 ```bash
-pip install stable-baselines3 tensorboard gymnasium imitation
+~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 tensorboard gymnasium imitation
+```
+
+### Camera Streaming Dependencies (Optional)
+
+For camera streaming functionality, install GStreamer and PyGObject:
+
+```bash
+# System packages (Ubuntu/Debian)
+sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+  libcairo2-dev libgirepository-2.0-dev pkg-config python3-dev \
+  gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
+
+# Python package (in Isaac Sim environment)
+~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install PyGObject
 ```
 
 ## Quick Start
@@ -66,6 +76,7 @@ pip install stable-baselines3 tensorboard gymnasium imitation
 | Space | Stop (emergency brake) |
 | R | Reset robot position |
 | G | Spawn new goal |
+| C | Toggle camera viewer |
 | Esc | Exit |
 
 ### Recording Controls
@@ -82,6 +93,7 @@ pip install stable-baselines3 tensorboard gymnasium imitation
 isaac-sim-jetbot-keyboard/
 ├── src/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
+│   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
 │   ├── eval_policy.py                # Policy evaluation
@@ -111,6 +123,12 @@ isaac-sim-jetbot-keyboard/
 
 # With recording enabled
 ./run.sh --enable-recording
+
+# Disable camera streaming
+./run.sh --no-camera
+
+# Custom camera port
+./run.sh --camera-port 5601
 
 # Combine options
 ./run.sh --enable-recording --num-obstacles 8 --demo-path demos/my_demo.npz
@@ -216,6 +234,7 @@ tensorboard --logdir runs/
 - **DifferentialController**: Converts velocity commands to wheel speeds
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations
+- **CameraStreamer**: GStreamer H264 RTP UDP camera streaming
 
 ### Obstacle System
 

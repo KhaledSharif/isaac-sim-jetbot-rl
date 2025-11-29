@@ -48,6 +48,10 @@ WheeledRobot = None
 DifferentialController = None
 get_assets_root_path = None
 
+# Camera streaming (optional - graceful fallback if unavailable)
+CameraStreamer = None
+CAMERA_STREAMING_AVAILABLE = False
+
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
@@ -77,6 +81,10 @@ class TUIRenderer:  # pragma: no cover
         self.recording_stats = {}
         self.checkpoint_flash_active = False
         self.recording_enabled = False
+
+        # Camera streaming status
+        self.streaming_active = False
+        self.camera_enabled = False
 
     def set_pressed_key(self, key):  # pragma: no cover
         """Mark a key as pressed for highlighting."""
@@ -114,6 +122,14 @@ class TUIRenderer:  # pragma: no cover
     def set_recording_enabled(self, enabled: bool):  # pragma: no cover
         """Set whether recording mode is enabled."""
         self.recording_enabled = enabled
+
+    def set_streaming_status(self, is_streaming: bool):  # pragma: no cover
+        """Update camera streaming status for display."""
+        self.streaming_active = is_streaming
+
+    def set_camera_enabled(self, enabled: bool):  # pragma: no cover
+        """Set whether camera mode is enabled."""
+        self.camera_enabled = enabled
 
     def _render_recording_panel(self) -> Panel:  # pragma: no cover
         """Render recording status panel with controls."""
@@ -235,6 +251,20 @@ class TUIRenderer:  # pragma: no cover
             Text("New Goal", style="dim"),
             ""
         )
+
+        # Camera control (if enabled)
+        if self.camera_enabled:
+            table.add_row(Text("", style=""))
+            if self.streaming_active:
+                streaming_indicator = Text("LIVE", style="green bold")
+            else:
+                streaming_indicator = Text("OFF", style="dim")
+            table.add_row(
+                self._create_button("C", "c"),
+                Text.assemble("Camera [", streaming_indicator, "]"),
+                ""
+            )
+
         table.add_row(
             Text("[Esc]", style="yellow"),
             Text("Exit", style="dim"),
@@ -1054,7 +1084,8 @@ class JetbotKeyboardController:
     START_ORIENTATION = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion (w, x, y, z)
 
     def __init__(self, enable_recording: bool = False, demo_path: str = None,
-                 reward_mode: str = "dense", num_obstacles: int = 5):
+                 reward_mode: str = "dense", num_obstacles: int = 5,
+                 enable_camera: bool = True, camera_port: int = 5600):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1062,10 +1093,13 @@ class JetbotKeyboardController:
             demo_path: Path to save demonstrations (auto-generated with timestamp if None)
             reward_mode: Reward computation mode ('dense' or 'sparse')
             num_obstacles: Number of obstacles to spawn (default: 5)
+            enable_camera: Enable camera streaming mode (default: True)
+            camera_port: UDP port for camera stream (default: 5600)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
         global DifferentialController, get_assets_root_path
+        global CameraStreamer, CAMERA_STREAMING_AVAILABLE
 
         if simulation_app is None:
             simulation_app = SimulationApp({"headless": False})
@@ -1085,10 +1119,21 @@ class JetbotKeyboardController:
             DifferentialController = _DifferentialController
             get_assets_root_path = _get_assets_root_path
 
+        # Try to import camera streaming module
+        if CameraStreamer is None:
+            try:
+                from camera_streamer import CameraStreamer as _CameraStreamer
+                CameraStreamer = _CameraStreamer
+                CAMERA_STREAMING_AVAILABLE = True
+            except ImportError as e:
+                print(f"[Warning] Camera streaming not available: {e}")
+                CAMERA_STREAMING_AVAILABLE = False
+
         # Create TUI renderer
         self.tui = TUIRenderer()
         self.tui.set_last_command("Initializing...")
         self.tui.set_recording_enabled(enable_recording)
+        self.tui.set_camera_enabled(enable_camera and CAMERA_STREAMING_AVAILABLE)
 
         # Create world
         self.world = World(stage_units_in_meters=1.0)
@@ -1160,6 +1205,11 @@ class JetbotKeyboardController:
         if self.enable_recording:
             self._init_recording_components()
 
+        # Camera streaming configuration
+        self.enable_camera = enable_camera and CAMERA_STREAMING_AVAILABLE
+        self.camera_port = camera_port
+        self.camera_streamer = None
+
         # Terminal settings (for disabling echo)
         self.old_terminal_settings = None
 
@@ -1172,7 +1222,9 @@ class JetbotKeyboardController:
 
         init_msg = "Initialization complete"
         if self.enable_recording:
-            init_msg += " [RECORDING MODE]"
+            init_msg += " [RECORDING]"
+        if self.enable_camera:
+            init_msg += " [CAMERA]"
         self.tui.set_last_command(init_msg)
 
     def _init_recording_components(self):
@@ -1194,6 +1246,44 @@ class JetbotKeyboardController:
         if self.scene_manager is not None:
             self.scene_manager.spawn_goal_marker()
             self.tui.set_last_command("Recording scene ready - Press ` to start")
+
+    def _init_camera(self):
+        """Initialize camera streaming components."""
+        if not self.enable_camera or not CAMERA_STREAMING_AVAILABLE:
+            return
+
+        try:
+            self.camera_streamer = CameraStreamer(
+                world=self.world,
+                robot_prim_path="/World/Jetbot",
+                port=self.camera_port
+            )
+
+            if self.camera_streamer.create_camera():
+                self.tui.set_last_command("Camera initialized - Press C to view")
+            else:
+                self.camera_streamer = None
+                self.enable_camera = False
+                self.tui.set_camera_enabled(False)
+        except Exception as e:
+            print(f"[Warning] Camera init failed: {e}")
+            self.camera_streamer = None
+            self.enable_camera = False
+            self.tui.set_camera_enabled(False)
+
+    def _toggle_camera_viewer(self):
+        """Toggle camera viewer and streaming on/off."""
+        if self.camera_streamer is None:
+            self.tui.set_last_command("Camera not available")
+            return
+
+        is_now_streaming = self.camera_streamer.toggle()
+        self.tui.set_streaming_status(is_now_streaming)
+
+        if is_now_streaming:
+            self.tui.set_last_command("Camera viewer opened")
+        else:
+            self.tui.set_last_command("Camera viewer closed")
 
     def _get_robot_pose(self) -> tuple:
         """Get current robot position and heading.
@@ -1347,6 +1437,9 @@ class JetbotKeyboardController:
                     self.tui.set_last_command("Reset to start position")
                 elif cmd_value == 'g':
                     self._spawn_new_goal()
+                # Camera commands
+                elif cmd_value == 'c':
+                    self._toggle_camera_viewer()
                 # Movement commands
                 elif cmd_value in ('w', 's', 'a', 'd', 'space'):
                     self._process_movement_command(cmd_value)
@@ -1504,6 +1597,13 @@ class JetbotKeyboardController:
         # Reset world after scene setup
         self.world.reset()
 
+        # Initialize camera after world reset (camera needs world to be ready)
+        if self.enable_camera:
+            self._init_camera()
+            # Initialize camera sensor for rendering
+            if self.camera_streamer is not None:
+                self.camera_streamer.initialize()
+
         # Build initial observation if recording enabled
         if self.enable_recording:
             self.current_obs = self._build_current_observation()
@@ -1512,8 +1612,10 @@ class JetbotKeyboardController:
         last_key_processed = None
 
         ready_msg = "Ready - WASD to move, Space to stop"
+        if self.enable_camera:
+            ready_msg += " | C=Camera"
         if self.enable_recording:
-            ready_msg += " | `=Record, [=Success, ]=Fail"
+            ready_msg += " | `=Record"
         self.tui.set_last_command(ready_msg)
 
         # Disable terminal echo
@@ -1540,6 +1642,10 @@ class JetbotKeyboardController:
 
                         # Apply current velocity control
                         self._apply_control()
+
+                        # Capture and stream camera frame if streaming is active
+                        if self.camera_streamer is not None and self.camera_streamer.is_streaming:
+                            self.camera_streamer.capture_and_stream()
 
                         # Record step if recording is active
                         if self.enable_recording and self.action_mapper is not None:
@@ -1571,6 +1677,10 @@ class JetbotKeyboardController:
                         live.update(self.tui.render())
 
         finally:
+            # Cleanup camera streaming
+            if self.camera_streamer is not None:
+                self.camera_streamer.cleanup()
+
             # Auto-save recording on exit if there's data
             if self.enable_recording and self.recorder is not None:
                 if len(self.recorder.observations) > 0:
@@ -1611,6 +1721,14 @@ def parse_args():
         '--num-obstacles', type=int, default=5,
         help='Number of obstacles to spawn (default: 5)'
     )
+    parser.add_argument(
+        '--no-camera', action='store_true',
+        help='Disable camera streaming'
+    )
+    parser.add_argument(
+        '--camera-port', type=int, default=5600,
+        help='UDP port for camera stream (default: 5600)'
+    )
     return parser.parse_args()
 
 
@@ -1620,6 +1738,8 @@ if __name__ == "__main__":
         enable_recording=args.enable_recording,
         demo_path=args.demo_path,
         reward_mode=args.reward_mode,
-        num_obstacles=args.num_obstacles
+        num_obstacles=args.num_obstacles,
+        enable_camera=not args.no_camera,
+        camera_port=args.camera_port
     )
     controller.run()
