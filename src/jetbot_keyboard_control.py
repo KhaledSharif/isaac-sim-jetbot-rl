@@ -1329,9 +1329,7 @@ class JetbotKeyboardController:
         try:
             self.ros2_bridge = ROS2Bridge(robot_prim_path="/World/Jetbot")
 
-            # Pass stage to create stereo cameras and IMU sensor prims
-            stage = self.world.stage
-            if self.ros2_bridge.create_ros2_graph(stage=stage):
+            if self.ros2_bridge.create_ros2_graph():
                 topics = self.ros2_bridge.get_published_topics()
                 self.tui.set_last_command(f"ROS2 bridge: {len(topics)} topics")
             else:
