@@ -34,10 +34,12 @@ from isaacsim import SimulationApp
 simulation_app = None
 
 import argparse
+import heapq
 import numpy as np
 import threading
 import sys
 import termios
+from math import ceil, atan2, pi
 from pynput import keyboard
 
 # Isaac Sim imports must happen AFTER SimulationApp is created
@@ -1096,56 +1098,361 @@ class RewardComputer:
         return reward
 
 
+class OccupancyGrid:
+    """2D boolean occupancy grid for C-space planning.
+
+    Builds from obstacle_metadata with inflation by robot radius so that
+    A* can treat the robot as a point.
+    """
+
+    def __init__(self, grid, x_min, y_min, cell_size, width, height):
+        self.grid = grid          # 2D bool ndarray (True = occupied)
+        self.x_min = x_min
+        self.y_min = y_min
+        self.cell_size = cell_size
+        self.width = width        # columns
+        self.height = height      # rows
+
+    @classmethod
+    def from_scene(cls, obstacle_metadata, workspace_bounds,
+                   robot_radius=0.08, cell_size=0.05):
+        """Build occupancy grid from scene geometry.
+
+        Args:
+            obstacle_metadata: List of (center_2d, radius) tuples
+            workspace_bounds: Dict with 'x' and 'y' keys, each [min, max]
+            robot_radius: Robot radius for C-space inflation
+            cell_size: Grid cell size in meters
+
+        Returns:
+            OccupancyGrid instance
+        """
+        x_min, x_max = workspace_bounds['x']
+        y_min, y_max = workspace_bounds['y']
+
+        width = ceil((x_max - x_min) / cell_size)
+        height = ceil((y_max - y_min) / cell_size)
+
+        grid = np.zeros((height, width), dtype=bool)
+
+        # Mark cells within robot_radius of workspace walls as occupied
+        wall_cells = ceil(robot_radius / cell_size)
+        if wall_cells > 0:
+            grid[:wall_cells, :] = True    # bottom wall
+            grid[-wall_cells:, :] = True   # top wall
+            grid[:, :wall_cells] = True    # left wall
+            grid[:, -wall_cells:] = True   # right wall
+
+        # Mark cells within inflated radius of each obstacle
+        if obstacle_metadata:
+            for center, radius in obstacle_metadata:
+                inflated_r = radius + robot_radius
+                cx, cy = center[0], center[1]
+
+                # Compute bounding box in grid coords
+                gx_min = int((cx - inflated_r - x_min) / cell_size)
+                gx_max = int((cx + inflated_r - x_min) / cell_size) + 1
+                gy_min = int((cy - inflated_r - y_min) / cell_size)
+                gy_max = int((cy + inflated_r - y_min) / cell_size) + 1
+
+                gx_min = max(0, gx_min)
+                gx_max = min(width, gx_max)
+                gy_min = max(0, gy_min)
+                gy_max = min(height, gy_max)
+
+                for gy in range(gy_min, gy_max):
+                    for gx in range(gx_min, gx_max):
+                        # Cell center in world coords
+                        wx = x_min + (gx + 0.5) * cell_size
+                        wy = y_min + (gy + 0.5) * cell_size
+                        dist = ((wx - cx) ** 2 + (wy - cy) ** 2) ** 0.5
+                        if dist <= inflated_r:
+                            grid[gy, gx] = True
+
+        return cls(grid, x_min, y_min, cell_size, width, height)
+
+    def world_to_grid(self, wx, wy):
+        """Convert world coordinates to grid cell indices."""
+        gx = int((wx - self.x_min) / self.cell_size)
+        gy = int((wy - self.y_min) / self.cell_size)
+        return gx, gy
+
+    def grid_to_world(self, gx, gy):
+        """Convert grid cell indices to world coordinates (cell center)."""
+        wx = self.x_min + (gx + 0.5) * self.cell_size
+        wy = self.y_min + (gy + 0.5) * self.cell_size
+        return wx, wy
+
+    def is_occupied(self, gx, gy):
+        """Check if cell is occupied. Out-of-bounds counts as occupied."""
+        if gx < 0 or gx >= self.width or gy < 0 or gy >= self.height:
+            return True
+        return bool(self.grid[gy, gx])
+
+    def is_valid(self, gx, gy):
+        """Check if cell is in-bounds and free."""
+        return not self.is_occupied(gx, gy)
+
+
+def astar_search(grid, start_world, goal_world):
+    """A* search on occupancy grid with 8-connected movement.
+
+    Args:
+        grid: OccupancyGrid instance
+        start_world: (world_x, world_y) start position
+        goal_world: (world_x, world_y) goal position
+
+    Returns:
+        List of (world_x, world_y) waypoints from start to goal,
+        or [] if no path found.
+    """
+    sx, sy = grid.world_to_grid(start_world[0], start_world[1])
+    gx, gy = grid.world_to_grid(goal_world[0], goal_world[1])
+
+    # If start or goal is occupied, try to find nearest free cell
+    if grid.is_occupied(sx, sy):
+        sx, sy = _find_nearest_free(grid, sx, sy)
+        if sx is None:
+            return []
+    if grid.is_occupied(gx, gy):
+        gx, gy = _find_nearest_free(grid, gx, gy)
+        if gx is None:
+            return []
+
+    SQRT2 = 1.41421356
+
+    # 8-connected neighbors: (dx, dy, cost)
+    neighbors = [
+        (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+        (1, 1, SQRT2), (1, -1, SQRT2), (-1, 1, SQRT2), (-1, -1, SQRT2),
+    ]
+
+    def heuristic(x, y):
+        """Octile distance heuristic."""
+        dx = abs(x - gx)
+        dy = abs(y - gy)
+        return max(dx, dy) + (SQRT2 - 1.0) * min(dx, dy)
+
+    open_set = [(heuristic(sx, sy), 0.0, sx, sy)]
+    g_score = {(sx, sy): 0.0}
+    came_from = {}
+
+    while open_set:
+        f, g, cx, cy = heapq.heappop(open_set)
+
+        if cx == gx and cy == gy:
+            # Reconstruct path
+            path = []
+            node = (gx, gy)
+            while node in came_from:
+                path.append(grid.grid_to_world(node[0], node[1]))
+                node = came_from[node]
+            path.append(grid.grid_to_world(sx, sy))
+            path.reverse()
+            return _simplify_path(path)
+
+        if g > g_score.get((cx, cy), float('inf')):
+            continue
+
+        for dx, dy, cost in neighbors:
+            nx, ny = cx + dx, cy + dy
+            if not grid.is_valid(nx, ny):
+                continue
+
+            # Corner cutting prevention: for diagonals, both adjacent
+            # cardinal cells must be free
+            if dx != 0 and dy != 0:
+                if grid.is_occupied(cx + dx, cy) or grid.is_occupied(cx, cy + dy):
+                    continue
+
+            ng = g + cost
+            if ng < g_score.get((nx, ny), float('inf')):
+                g_score[(nx, ny)] = ng
+                came_from[(nx, ny)] = (cx, cy)
+                heapq.heappush(open_set, (ng + heuristic(nx, ny), ng, nx, ny))
+
+    return []  # No path found
+
+
+def _find_nearest_free(grid, gx, gy, max_radius=10):
+    """Find nearest free cell to (gx, gy) via BFS."""
+    from collections import deque
+    queue = deque([(gx, gy, 0)])
+    visited = {(gx, gy)}
+    while queue:
+        x, y, d = queue.popleft()
+        if d > max_radius:
+            return None, None
+        if grid.is_valid(x, y):
+            return x, y
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx, ny = x + dx, y + dy
+            if (nx, ny) not in visited and 0 <= nx < grid.width and 0 <= ny < grid.height:
+                visited.add((nx, ny))
+                queue.append((nx, ny, d + 1))
+    return None, None
+
+
+def _simplify_path(path):
+    """Remove collinear intermediate waypoints, keeping only turning points."""
+    if len(path) <= 2:
+        return path
+    simplified = [path[0]]
+    for i in range(1, len(path) - 1):
+        # Check if direction changes
+        dx1 = path[i][0] - path[i - 1][0]
+        dy1 = path[i][1] - path[i - 1][1]
+        dx2 = path[i + 1][0] - path[i][0]
+        dy2 = path[i + 1][1] - path[i][1]
+        # If direction changes, keep this waypoint
+        if abs(dx1 * dy2 - dy1 * dx2) > 1e-9:
+            simplified.append(path[i])
+    simplified.append(path[-1])
+    return simplified
+
+
 class AutoPilot:
-    """Noisy proportional controller for autonomous demo collection.
+    """A*-based expert controller with privileged scene access.
 
-    Drives the robot toward goal positions using a P-controller with
-    Gaussian noise to produce diverse, human-like trajectories.
+    Uses full obstacle geometry to plan collision-free paths via A*,
+    then follows them with pure-pursuit and Gaussian noise for
+    diverse, high-quality demonstration trajectories.
 
-    Input: 10D observation vector (uses obs[7]=distance, obs[8]=angle_to_goal)
+    Input: observation vector (uses obs[0:2]=position, obs[2]=heading,
+           obs[7]=distance, obs[8]=angle_to_goal, obs[5:7]=goal)
     Output: (linear_vel, angular_vel) in physical units
     """
 
-    def __init__(self, max_linear_vel: float = 0.3, max_angular_vel: float = 1.0,
-                 kp_linear: float = 0.25, kp_angular: float = 1.5,
-                 noise_linear: float = 0.03, noise_angular: float = 0.15):
+    def __init__(self, max_linear_vel=0.3, max_angular_vel=1.0,
+                 scene_manager=None, robot_radius=0.08, cell_size=0.05,
+                 noise_linear=0.02, noise_angular=0.1,
+                 lookahead=0.2, replan_deviation=0.3,
+                 kp_linear=0.25, kp_angular=1.5):
         self.max_linear_vel = max_linear_vel
         self.max_angular_vel = max_angular_vel
-        self.kp_linear = kp_linear
-        self.kp_angular = kp_angular
+        self.scene_manager = scene_manager
+        self.robot_radius = robot_radius
+        self.cell_size = cell_size
         self.noise_linear = noise_linear
         self.noise_angular = noise_angular
+        self.lookahead = lookahead
+        self.replan_deviation = replan_deviation
 
-    def compute_action(self, obs: np.ndarray) -> tuple:
-        """Compute velocity command from observation.
+        self.kp_linear = kp_linear
+        self.kp_angular = kp_angular
+
+        self._path = []
+        self._current_waypoint_idx = 0
+
+    def plan_path(self, robot_position_2d):
+        """Build occupancy grid from scene and run A*.
 
         Args:
-            obs: 10D observation vector
+            robot_position_2d: (x, y) current robot position
+
+        Returns:
+            True if a path was found, False otherwise
+        """
+        if self.scene_manager is None:
+            return False
+
+        goal = self.scene_manager.get_goal_position()
+        if goal is None:
+            return False
+
+        occ_grid = OccupancyGrid.from_scene(
+            self.scene_manager.get_obstacle_metadata(),
+            self.scene_manager.workspace_bounds,
+            robot_radius=self.robot_radius,
+            cell_size=self.cell_size,
+        )
+
+        start = (float(robot_position_2d[0]), float(robot_position_2d[1]))
+        goal_2d = (float(goal[0]), float(goal[1]))
+
+        self._path = astar_search(occ_grid, start, goal_2d)
+        self._current_waypoint_idx = 0
+
+        return len(self._path) > 0
+
+    def compute_action(self, obs):
+        """Compute velocity command using pure-pursuit on A* path.
+
+        Falls back to proportional control if no path is available.
+
+        Args:
+            obs: Observation vector (10D or 34D)
 
         Returns:
             Tuple of (linear_vel, angular_vel) in physical units
         """
-        distance = obs[7]
-        angle_to_goal = obs[8]
+        robot_x, robot_y = obs[0], obs[1]
+        heading = obs[2]
 
-        # Angular: proportional to angle error + noise
-        angular_vel = self.kp_angular * angle_to_goal + np.random.normal(0, self.noise_angular)
+        # If we have a valid path, use pure-pursuit
+        if self._path and self._current_waypoint_idx < len(self._path):
+            # Advance waypoint index past those within lookahead
+            while self._current_waypoint_idx < len(self._path) - 1:
+                wp = self._path[self._current_waypoint_idx]
+                dist_to_wp = ((robot_x - wp[0]) ** 2 + (robot_y - wp[1]) ** 2) ** 0.5
+                if dist_to_wp > self.lookahead:
+                    break
+                self._current_waypoint_idx += 1
 
-        # Alignment factor: don't drive forward when facing away from goal
-        alignment = max(0.0, 1.0 - abs(angle_to_goal) / (np.pi / 2))
+            target = self._path[self._current_waypoint_idx]
+            dx = target[0] - robot_x
+            dy = target[1] - robot_y
 
-        # Linear: proportional to alignment + noise
-        linear_vel = self.kp_linear * alignment + np.random.normal(0, self.noise_linear)
+            # Check if we've deviated too far from path — trigger replan
+            dist_to_target = (dx ** 2 + dy ** 2) ** 0.5
+            if dist_to_target > self.replan_deviation:
+                self.plan_path(np.array([robot_x, robot_y]))
 
-        # Slowdown near goal to avoid overshooting the 0.15m threshold
-        if distance < 0.3:
-            linear_vel *= distance / 0.3
+            # Angle error
+            desired_heading = atan2(dy, dx)
+            angle_error = desired_heading - heading
+            # Normalize to [-pi, pi]
+            while angle_error > pi:
+                angle_error -= 2 * pi
+            while angle_error < -pi:
+                angle_error += 2 * pi
+
+            # Angular velocity: proportional + noise
+            angular_vel = self.kp_angular * angle_error + np.random.normal(0, self.noise_angular)
+
+            # Alignment: reduce forward speed when facing away
+            alignment = max(0.0, 1.0 - abs(angle_error) / (pi / 2))
+
+            # Linear velocity: proportional to alignment + noise
+            linear_vel = self.kp_linear * alignment + np.random.normal(0, self.noise_linear)
+
+            # Slowdown near goal
+            distance_to_goal = obs[7]
+            if distance_to_goal < 0.3:
+                linear_vel *= distance_to_goal / 0.3
+
+        else:
+            # Fallback: proportional control toward goal
+            distance_to_goal = obs[7]
+            angle_to_goal = obs[8]
+
+            angular_vel = self.kp_angular * angle_to_goal + np.random.normal(0, self.noise_angular)
+            alignment = max(0.0, 1.0 - abs(angle_to_goal) / (pi / 2))
+            linear_vel = self.kp_linear * alignment + np.random.normal(0, self.noise_linear)
+
+            if distance_to_goal < 0.3:
+                linear_vel *= distance_to_goal / 0.3
 
         # Clip to velocity limits
         linear_vel = np.clip(linear_vel, -self.max_linear_vel, self.max_linear_vel)
         angular_vel = np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
 
         return float(linear_vel), float(angular_vel)
+
+    def reset(self):
+        """Clear cached path for new episode."""
+        self._path = []
+        self._current_waypoint_idx = 0
 
 
 class LidarSensor:
@@ -1435,6 +1742,10 @@ class JetbotKeyboardController:
         self.reward_mode = reward_mode
         self.use_lidar = use_lidar
 
+        # Force LiDAR in automatic mode (A* expert needs 34D observations)
+        if automatic:
+            self.use_lidar = True
+
         # Generate timestamped filename if no path provided
         if demo_path is None:
             from datetime import datetime
@@ -1475,7 +1786,8 @@ class JetbotKeyboardController:
         self.headless_tui = headless_tui
         self.auto_pilot = AutoPilot(
             max_linear_vel=self.MAX_LINEAR_VELOCITY,
-            max_angular_vel=self.MAX_ANGULAR_VELOCITY
+            max_angular_vel=self.MAX_ANGULAR_VELOCITY,
+            scene_manager=self.scene_manager,
         ) if automatic else None
         self.auto_episode_count = 0
         self.auto_step_count = 0
@@ -1696,6 +2008,11 @@ class JetbotKeyboardController:
         # Reset scene for next episode
         self._reset_recording_episode()
 
+        # Replan A* path for next episode
+        if self.auto_pilot is not None:
+            self.auto_pilot.reset()
+            self._plan_autopilot_path()
+
         # Rebuild observation for next episode
         self.current_obs = self._build_current_observation()
 
@@ -1708,6 +2025,17 @@ class JetbotKeyboardController:
             print(msg)
         else:
             self.tui.set_last_command(msg)
+
+    def _plan_autopilot_path(self):
+        """Plan A* path for autopilot. Respawn goal up to 10 times if unreachable."""
+        if self.auto_pilot is None:
+            return
+        position, _ = self._get_robot_pose()
+        for _ in range(10):
+            if self.auto_pilot.plan_path(position[:2]):
+                return
+            self.scene_manager.reset_goal()
+            self.current_obs = self._build_current_observation()
 
     def _on_key_press(self, key):
         """Handle key press events from pynput."""
@@ -1945,6 +2273,10 @@ class JetbotKeyboardController:
         if self.automatic and self.recorder is not None:
             self.recorder.start_recording()
 
+        # Plan initial A* path for autopilot
+        if self.automatic and self.auto_pilot is not None:
+            self._plan_autopilot_path()
+
         reset_needed = False
         last_key_processed = None
 
@@ -2012,8 +2344,16 @@ class JetbotKeyboardController:
                             position, _ = self._get_robot_pose()
                             goal_reached = self.scene_manager.check_goal_reached(position)
 
+                            # Collision detection via LiDAR
+                            collision = False
+                            if self.current_obs is not None and len(self.current_obs) > 10:
+                                min_lidar_m = float(self.current_obs[10:].min()) * 3.0  # denormalize
+                                collision = min_lidar_m < 0.08
+
                             if goal_reached:
                                 self._handle_auto_episode_end(True, "Goal reached")
+                            elif collision:
+                                self._handle_auto_episode_end(False, "Collision")
                             elif self._is_out_of_bounds(position):
                                 self._handle_auto_episode_end(False, "Out of bounds")
                             elif self.auto_step_count >= self.auto_max_episode_steps:

@@ -39,7 +39,8 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **RewardComputer**: Computes navigation rewards
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming (`src/camera_streamer.py`)
 - **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
-- **AutoPilot**: Noisy proportional controller for autonomous demo collection
+- **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
+- **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
 
 ## Keyboard Controls
 
@@ -117,6 +118,7 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 ./run.sh --enable-recording --automatic --num-episodes 200 --headless-tui
 
 # Collect 34D demos with LiDAR observations
+# Note: --automatic now forces --use-lidar automatically
 ./run.sh --enable-recording --automatic --use-lidar
 
 # Training
