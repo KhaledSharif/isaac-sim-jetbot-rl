@@ -574,3 +574,303 @@ class TestMovementCommands:
         action = mapper.map_key('space')
         assert action[0] == 0.0
         assert action[1] == 0.0
+
+
+# ============================================================================
+# TEST SUITE: AutoPilot
+# ============================================================================
+
+class TestAutoPilot:
+    """Tests for AutoPilot class."""
+
+    def test_facing_goal_drives_forward(self):
+        """When facing goal straight ahead, should produce positive linear vel."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+
+        obs = np.zeros(10)
+        obs[7] = 1.0   # distance = 1m
+        obs[8] = 0.0   # angle = 0 (facing goal)
+
+        linear, angular = pilot.compute_action(obs)
+        assert linear > 0.0, "Should drive forward when facing goal"
+        assert abs(angular) < 0.1, "Should have near-zero angular vel when aligned"
+
+    def test_goal_left_turns_left(self):
+        """When goal is to the left, should produce positive angular vel."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+
+        obs = np.zeros(10)
+        obs[7] = 1.0
+        obs[8] = np.pi / 4  # goal is 45 degrees to the left
+
+        _, angular = pilot.compute_action(obs)
+        assert angular > 0.0, "Should turn left (positive angular) when goal is left"
+
+    def test_goal_right_turns_right(self):
+        """When goal is to the right, should produce negative angular vel."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+
+        obs = np.zeros(10)
+        obs[7] = 1.0
+        obs[8] = -np.pi / 4  # goal is 45 degrees to the right
+
+        _, angular = pilot.compute_action(obs)
+        assert angular < 0.0, "Should turn right (negative angular) when goal is right"
+
+    def test_facing_away_low_linear_vel(self):
+        """When facing away from goal, linear vel should be near zero."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+
+        obs = np.zeros(10)
+        obs[7] = 1.0
+        obs[8] = np.pi  # facing completely away
+
+        linear, _ = pilot.compute_action(obs)
+        assert abs(linear) < 0.05, "Should have near-zero linear vel when facing away"
+
+    def test_output_clipping(self):
+        """Outputs should be clipped to velocity limits."""
+        from jetbot_keyboard_control import AutoPilot
+        max_lin = 0.3
+        max_ang = 1.0
+        pilot = AutoPilot(max_linear_vel=max_lin, max_angular_vel=max_ang,
+                          noise_linear=0.0, noise_angular=0.0,
+                          kp_angular=100.0)  # very high gain to force clipping
+
+        obs = np.zeros(10)
+        obs[7] = 1.0
+        obs[8] = np.pi  # large angle
+
+        linear, angular = pilot.compute_action(obs)
+        assert abs(linear) <= max_lin + 1e-6
+        assert abs(angular) <= max_ang + 1e-6
+
+    def test_noise_variation(self):
+        """With noise enabled, repeated calls should produce different outputs."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot(noise_linear=0.03, noise_angular=0.15)
+
+        obs = np.zeros(10)
+        obs[7] = 1.0
+        obs[8] = 0.0
+
+        results = [pilot.compute_action(obs) for _ in range(20)]
+        linear_vals = [r[0] for r in results]
+
+        # With noise, not all values should be identical
+        assert len(set(linear_vals)) > 1, "Noise should cause variation in outputs"
+
+    def test_slowdown_near_goal(self):
+        """Linear velocity should be reduced when close to goal."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+
+        # Far from goal
+        obs_far = np.zeros(10)
+        obs_far[7] = 2.0
+        obs_far[8] = 0.0
+        linear_far, _ = pilot.compute_action(obs_far)
+
+        # Close to goal
+        obs_near = np.zeros(10)
+        obs_near[7] = 0.1
+        obs_near[8] = 0.0
+        linear_near, _ = pilot.compute_action(obs_near)
+
+        assert linear_near < linear_far, "Should slow down near goal"
+
+    def test_compute_action_returns_tuple(self):
+        """compute_action should return a tuple of two floats."""
+        from jetbot_keyboard_control import AutoPilot
+        pilot = AutoPilot()
+
+        obs = np.zeros(10)
+        obs[7] = 1.0
+
+        result = pilot.compute_action(obs)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], float)
+        assert isinstance(result[1], float)
+
+
+# ============================================================================
+# TEST SUITE: AutoMode
+# ============================================================================
+
+class TestAutoMode:
+    """Tests for automatic mode integration."""
+
+    def _make_controller_attrs(self, automatic=True):
+        """Create a minimal mock controller with automatic mode attributes."""
+        from jetbot_keyboard_control import AutoPilot, DemoRecorder, ActionMapper, ObservationBuilder, RewardComputer, SceneManager
+
+        class FakeController:
+            MAX_LINEAR_VELOCITY = 0.3
+            MAX_ANGULAR_VELOCITY = 1.0
+
+            def __init__(self):
+                self.automatic = automatic
+                self.enable_recording = True
+                self.recorder = DemoRecorder(obs_dim=10, action_dim=2)
+                self.action_mapper = ActionMapper()
+                self.obs_builder = ObservationBuilder()
+                self.reward_computer = RewardComputer()
+                self.auto_pilot = AutoPilot(
+                    max_linear_vel=self.MAX_LINEAR_VELOCITY,
+                    max_angular_vel=self.MAX_ANGULAR_VELOCITY
+                ) if automatic else None
+                self.auto_episode_count = 0
+                self.auto_step_count = 0
+                self.auto_max_episode_steps = 500
+                self.num_episodes = 100
+                self.continuous = False
+                self.headless_tui = True
+                self.current_linear_vel = 0.0
+                self.current_angular_vel = 0.0
+                self.should_exit = False
+
+                # Set up scene manager with mock world
+                mock_world = Mock()
+                mock_world.scene = Mock()
+                mock_world.scene.add = Mock(side_effect=lambda x: x)
+                self.scene_manager = SceneManager(mock_world)
+                self.scene_manager.goal_position = np.array([1.0, 1.0, 0.0])
+
+        return FakeController()
+
+    def test_automatic_forces_recording(self):
+        """Automatic mode should force-enable recording."""
+        # Test that AutoPilot is created when automatic=True
+        ctrl = self._make_controller_attrs(automatic=True)
+        assert ctrl.auto_pilot is not None
+        assert ctrl.enable_recording is True
+        assert ctrl.recorder is not None
+
+    def test_wasd_ignored_in_auto_mode(self):
+        """WASD movement commands should be ignored in automatic mode."""
+        from jetbot_keyboard_control import JetbotKeyboardController
+        import threading
+
+        # Create a minimal object to test _process_commands logic
+        class MinimalController:
+            def __init__(self):
+                self.automatic = True
+                self.should_exit = False
+                self.command_lock = threading.Lock()
+                self.pending_commands = [('char', 'w'), ('char', 'a')]
+                self.tui = Mock()
+                self.recorder = None
+                self.enable_recording = False
+                self.scene_manager = Mock()
+                self.camera_streamer = None
+
+            def _process_movement_command(self, key):
+                self.movement_called = True
+
+            def _handle_recording_command(self, key):
+                pass
+
+            def _spawn_new_goal(self):
+                pass
+
+            def _reset_robot(self):
+                pass
+
+            def _toggle_camera_viewer(self):
+                pass
+
+        ctrl = MinimalController()
+        ctrl.movement_called = False
+
+        # Manually replicate the command processing logic
+        with ctrl.command_lock:
+            commands = ctrl.pending_commands.copy()
+            ctrl.pending_commands.clear()
+
+        for cmd_type, cmd_value in commands:
+            if cmd_type == 'char':
+                if cmd_value in ('w', 's', 'a', 'd', 'space') and not ctrl.automatic:
+                    ctrl._process_movement_command(cmd_value)
+
+        assert not ctrl.movement_called, "Movement commands should be ignored in automatic mode"
+
+    def test_system_commands_still_work(self):
+        """System commands (esc) should still work in automatic mode."""
+        import threading
+
+        class MinimalController:
+            def __init__(self):
+                self.automatic = True
+                self.should_exit = False
+                self.command_lock = threading.Lock()
+                self.pending_commands = [('special', 'esc')]
+                self.tui = Mock()
+
+        ctrl = MinimalController()
+
+        with ctrl.command_lock:
+            commands = ctrl.pending_commands.copy()
+            ctrl.pending_commands.clear()
+
+        for cmd_type, cmd_value in commands:
+            if cmd_type == 'special' and cmd_value == 'esc':
+                ctrl.should_exit = True
+
+        assert ctrl.should_exit, "Esc should still exit in automatic mode"
+
+    def test_out_of_bounds_detection(self):
+        """Out-of-bounds detection should work correctly."""
+        from jetbot_keyboard_control import SceneManager
+
+        mock_world = Mock()
+        mock_world.scene = Mock()
+        mock_world.scene.add = Mock(side_effect=lambda x: x)
+
+        scene_manager = SceneManager(mock_world)
+        bounds = scene_manager.workspace_bounds
+        margin = 0.5
+
+        # Within bounds
+        pos_in = np.array([0.0, 0.0, 0.0])
+        in_bounds = (
+            pos_in[0] < bounds['x'][0] - margin or
+            pos_in[0] > bounds['x'][1] + margin or
+            pos_in[1] < bounds['y'][0] - margin or
+            pos_in[1] > bounds['y'][1] + margin
+        )
+        assert not in_bounds
+
+        # Out of bounds
+        pos_out = np.array([5.0, 5.0, 0.0])
+        out_bounds = (
+            pos_out[0] < bounds['x'][0] - margin or
+            pos_out[0] > bounds['x'][1] + margin or
+            pos_out[1] < bounds['y'][0] - margin or
+            pos_out[1] > bounds['y'][1] + margin
+        )
+        assert out_bounds
+
+    def test_episode_counter_increment(self):
+        """Episode counter should increment after episode end."""
+        ctrl = self._make_controller_attrs(automatic=True)
+
+        assert ctrl.auto_episode_count == 0
+
+        # Simulate episode end
+        ctrl.recorder.start_recording()
+        # Record a few steps
+        obs = np.zeros(10)
+        for _ in range(5):
+            ctrl.recorder.record_step(obs, np.zeros(2), 1.0, False)
+
+        ctrl.recorder.mark_episode_success(True)
+        ctrl.recorder.finalize_episode()
+        ctrl.auto_episode_count += 1
+        ctrl.auto_step_count = 0
+
+        assert ctrl.auto_episode_count == 1

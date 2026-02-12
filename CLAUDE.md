@@ -38,6 +38,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **ObservationBuilder**: Builds observation vectors from robot state
 - **RewardComputer**: Computes navigation rewards
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming (`src/camera_streamer.py`)
+- **AutoPilot**: Noisy proportional controller for autonomous demo collection
 
 ## Keyboard Controls
 
@@ -97,6 +98,18 @@ System:
 
 # With recording enabled
 ./run.sh --enable-recording
+
+# Automatic demo collection (100 episodes)
+./run.sh --enable-recording --automatic
+
+# Custom episode count
+./run.sh --enable-recording --automatic --num-episodes 200
+
+# Continuous mode (run until Esc)
+./run.sh --enable-recording --automatic --continuous
+
+# Headless TUI (console progress prints)
+./run.sh --enable-recording --automatic --num-episodes 200 --headless-tui
 
 # Training
 ./run.sh train_rl.py --headless --timesteps 500000

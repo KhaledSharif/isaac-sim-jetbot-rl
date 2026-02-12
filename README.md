@@ -9,6 +9,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Camera Streaming**: GStreamer H264 RTP UDP streaming from Jetbot camera
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
+- **Automatic Demo Collection**: Autonomous data collection with noisy proportional controller
 - **RL Training Pipeline**: Train PPO agents with optional behavioral cloning warmstart
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
 
@@ -134,6 +135,22 @@ isaac-sim-jetbot-keyboard/
 ./run.sh --enable-recording --num-obstacles 8 --demo-path demos/my_demo.npz
 ```
 
+### Automatic Demo Collection
+
+```bash
+# Collect 100 episodes automatically (default)
+./run.sh --enable-recording --automatic
+
+# Custom episode count
+./run.sh --enable-recording --automatic --num-episodes 200
+
+# Continuous mode (run until Esc)
+./run.sh --enable-recording --automatic --continuous
+
+# Headless TUI (console progress prints only)
+./run.sh --enable-recording --automatic --num-episodes 200 --headless-tui
+```
+
 ### Training
 
 ```bash
@@ -235,6 +252,7 @@ tensorboard --logdir runs/
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming
+- **AutoPilot**: Noisy proportional controller for autonomous demo collection
 
 ### Obstacle System
 

@@ -17,7 +17,7 @@ import numpy as np
 from pathlib import Path
 
 
-def load_demo_data(filepath: str, successful_only: bool = True):
+def load_demo_data(filepath: str, successful_only: bool = False):
     """Load demonstration data from NPZ file.
 
     Args:

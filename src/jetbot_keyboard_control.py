@@ -86,6 +86,10 @@ class TUIRenderer:  # pragma: no cover
         self.streaming_active = False
         self.camera_enabled = False
 
+        # Autopilot status
+        self.autopilot_active = False
+        self.autopilot_episode_progress = ""
+
     def set_pressed_key(self, key):  # pragma: no cover
         """Mark a key as pressed for highlighting."""
         self.pressed_keys.add(key)
@@ -130,6 +134,16 @@ class TUIRenderer:  # pragma: no cover
     def set_camera_enabled(self, enabled: bool):  # pragma: no cover
         """Set whether camera mode is enabled."""
         self.camera_enabled = enabled
+
+    def set_autopilot_status(self, active: bool, progress: str = ""):  # pragma: no cover
+        """Update autopilot status for display.
+
+        Args:
+            active: Whether autopilot is active
+            progress: Progress string e.g. "42/100"
+        """
+        self.autopilot_active = active
+        self.autopilot_episode_progress = progress
 
     def _render_recording_panel(self) -> Panel:  # pragma: no cover
         """Render recording status panel with controls."""
@@ -323,7 +337,11 @@ class TUIRenderer:  # pragma: no cover
         layout = Layout()
 
         # Mode header
-        mode_text = Text("JETBOT NAVIGATION", style="bold white on blue", justify="center")
+        if self.autopilot_active:
+            header_label = f"AUTO-PILOT [{self.autopilot_episode_progress}]"
+            mode_text = Text(header_label, style="bold white on green", justify="center")
+        else:
+            mode_text = Text("JETBOT NAVIGATION", style="bold white on blue", justify="center")
 
         # Split into rows: header + content
         layout.split_column(
@@ -771,19 +789,23 @@ class DemoRecorder:
         self.current_episode_return = 0.0
         self._pending_success = None
 
-    def save(self, filepath: str, metadata: dict = None) -> None:
+    def save(self, filepath: str, metadata: dict = None, finalize_pending: bool = True) -> None:
         """Save demonstrations to NPZ file.
 
         Args:
             filepath: Path to save the .npz file
             metadata: Optional dictionary of additional metadata
+            finalize_pending: If True, auto-finalize any in-progress episode
+                before saving. Set to False for checkpoint saves to avoid
+                prematurely marking episodes as failures.
         """
-        # Auto-finalize any pending episode data
-        pending_frames = len(self.observations) - self.current_episode_start
-        if pending_frames > 0:
-            if self._pending_success is None:
-                self._pending_success = False
-            self.finalize_episode()
+        # Auto-finalize any pending episode data (only on final save)
+        if finalize_pending:
+            pending_frames = len(self.observations) - self.current_episode_start
+            if pending_frames > 0:
+                if self._pending_success is None:
+                    self._pending_success = False
+                self.finalize_episode()
 
         # Build metadata
         save_metadata = {
@@ -1014,6 +1036,58 @@ class RewardComputer:
         return reward
 
 
+class AutoPilot:
+    """Noisy proportional controller for autonomous demo collection.
+
+    Drives the robot toward goal positions using a P-controller with
+    Gaussian noise to produce diverse, human-like trajectories.
+
+    Input: 10D observation vector (uses obs[7]=distance, obs[8]=angle_to_goal)
+    Output: (linear_vel, angular_vel) in physical units
+    """
+
+    def __init__(self, max_linear_vel: float = 0.3, max_angular_vel: float = 1.0,
+                 kp_linear: float = 0.25, kp_angular: float = 1.5,
+                 noise_linear: float = 0.03, noise_angular: float = 0.15):
+        self.max_linear_vel = max_linear_vel
+        self.max_angular_vel = max_angular_vel
+        self.kp_linear = kp_linear
+        self.kp_angular = kp_angular
+        self.noise_linear = noise_linear
+        self.noise_angular = noise_angular
+
+    def compute_action(self, obs: np.ndarray) -> tuple:
+        """Compute velocity command from observation.
+
+        Args:
+            obs: 10D observation vector
+
+        Returns:
+            Tuple of (linear_vel, angular_vel) in physical units
+        """
+        distance = obs[7]
+        angle_to_goal = obs[8]
+
+        # Angular: proportional to angle error + noise
+        angular_vel = self.kp_angular * angle_to_goal + np.random.normal(0, self.noise_angular)
+
+        # Alignment factor: don't drive forward when facing away from goal
+        alignment = max(0.0, 1.0 - abs(angle_to_goal) / (np.pi / 2))
+
+        # Linear: proportional to alignment + noise
+        linear_vel = self.kp_linear * alignment + np.random.normal(0, self.noise_linear)
+
+        # Slowdown near goal to avoid overshooting the 0.15m threshold
+        if distance < 0.3:
+            linear_vel *= distance / 0.3
+
+        # Clip to velocity limits
+        linear_vel = np.clip(linear_vel, -self.max_linear_vel, self.max_linear_vel)
+        angular_vel = np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
+
+        return float(linear_vel), float(angular_vel)
+
+
 class DemoPlayer:
     """Plays back recorded demonstrations.
 
@@ -1085,7 +1159,9 @@ class JetbotKeyboardController:
 
     def __init__(self, enable_recording: bool = False, demo_path: str = None,
                  reward_mode: str = "dense", num_obstacles: int = 5,
-                 enable_camera: bool = True, camera_port: int = 5600):
+                 enable_camera: bool = True, camera_port: int = 5600,
+                 automatic: bool = False, num_episodes: int = 100,
+                 continuous: bool = False, headless_tui: bool = False):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1095,6 +1171,10 @@ class JetbotKeyboardController:
             num_obstacles: Number of obstacles to spawn (default: 5)
             enable_camera: Enable camera streaming mode (default: True)
             camera_port: UDP port for camera stream (default: 5600)
+            automatic: Enable autopilot mode for autonomous demo collection
+            num_episodes: Number of episodes to collect in automatic mode
+            continuous: Ignore num_episodes, run until Esc
+            headless_tui: Disable Rich TUI, use console progress prints
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
@@ -1209,6 +1289,25 @@ class JetbotKeyboardController:
         self.enable_camera = enable_camera and CAMERA_STREAMING_AVAILABLE
         self.camera_port = camera_port
         self.camera_streamer = None
+
+        # Automatic mode configuration
+        self.automatic = automatic
+        self.num_episodes = num_episodes
+        self.continuous = continuous
+        self.headless_tui = headless_tui
+        self.auto_pilot = AutoPilot(
+            max_linear_vel=self.MAX_LINEAR_VELOCITY,
+            max_angular_vel=self.MAX_ANGULAR_VELOCITY
+        ) if automatic else None
+        self.auto_episode_count = 0
+        self.auto_step_count = 0
+        self.auto_max_episode_steps = 500
+
+        # Force-enable recording when automatic mode is set
+        if self.automatic and not self.enable_recording:
+            self.enable_recording = True
+            self.tui.set_recording_enabled(True)
+            self._init_recording_components()
 
         # Terminal settings (for disabling echo)
         self.old_terminal_settings = None
@@ -1362,8 +1461,8 @@ class JetbotKeyboardController:
         stats = self.recorder.get_stats()
         self.tui.set_recording_status(self.recorder.is_recording, stats)
 
-        # Auto-finalize episode on goal reached
-        if goal_reached:
+        # Auto-finalize episode on goal reached (manual mode only)
+        if goal_reached and not self.automatic:
             self.recorder.mark_episode_success(True)
             self.recorder.finalize_episode()
             self._reset_recording_episode()
@@ -1375,6 +1474,55 @@ class JetbotKeyboardController:
             self.scene_manager.reset_goal()
         self._reset_robot()
         self.current_obs = self._build_current_observation()
+
+    def _is_out_of_bounds(self, position) -> bool:
+        """Check if position is outside workspace bounds with margin.
+
+        Args:
+            position: [x, y, z] position
+
+        Returns:
+            True if position is out of bounds
+        """
+        margin = 0.5
+        bounds = self.scene_manager.workspace_bounds
+        return (
+            position[0] < bounds['x'][0] - margin or
+            position[0] > bounds['x'][1] + margin or
+            position[1] < bounds['y'][0] - margin or
+            position[1] > bounds['y'][1] + margin
+        )
+
+    def _handle_auto_episode_end(self, success: bool, reason: str):
+        """Handle episode termination in automatic mode.
+
+        Args:
+            success: Whether the episode was successful
+            reason: Human-readable reason for episode end
+        """
+        # Mark and finalize episode
+        self.recorder.mark_episode_success(success)
+        self.recorder.finalize_episode()
+
+        # Update counters
+        self.auto_episode_count += 1
+        self.auto_step_count = 0
+
+        # Reset scene for next episode
+        self._reset_recording_episode()
+
+        # Rebuild observation for next episode
+        self.current_obs = self._build_current_observation()
+
+        # Progress reporting
+        status = "SUCCESS" if success else "FAIL"
+        progress = f"[{self.auto_episode_count}/{self.num_episodes}]" if not self.continuous else f"[{self.auto_episode_count}]"
+        msg = f"Ep {progress} {status}: {reason}"
+
+        if self.headless_tui:
+            print(msg)
+        else:
+            self.tui.set_last_command(msg)
 
     def _on_key_press(self, key):
         """Handle key press events from pynput."""
@@ -1440,8 +1588,8 @@ class JetbotKeyboardController:
                 # Camera commands
                 elif cmd_value == 'c':
                     self._toggle_camera_viewer()
-                # Movement commands
-                elif cmd_value in ('w', 's', 'a', 'd', 'space'):
+                # Movement commands (ignored in automatic mode)
+                elif cmd_value in ('w', 's', 'a', 'd', 'space') and not self.automatic:
                     self._process_movement_command(cmd_value)
                     last_char_cmd = cmd_value
 
@@ -1530,7 +1678,7 @@ class JetbotKeyboardController:
         if self.recorder is None or len(self.recorder.observations) == 0:
             return False
 
-        self.recorder.save(self.demo_save_path)
+        self.recorder.save(self.demo_save_path, finalize_pending=False)
         self.tui.set_last_command(f"Checkpoint: {len(self.recorder.observations)} frames")
         self.checkpoint_flash_frames = self.checkpoint_flash_duration
         return True
@@ -1608,6 +1756,10 @@ class JetbotKeyboardController:
         if self.enable_recording:
             self.current_obs = self._build_current_observation()
 
+        # Auto-start recording in automatic mode
+        if self.automatic and self.recorder is not None:
+            self.recorder.start_recording()
+
         reset_needed = False
         last_key_processed = None
 
@@ -1622,7 +1774,13 @@ class JetbotKeyboardController:
         self._disable_terminal_echo()
 
         try:
-            with Live(self.tui.render(), refresh_per_second=10, screen=True) as live:
+            from contextlib import nullcontext
+            live_ctx = nullcontext() if self.headless_tui else Live(self.tui.render(), refresh_per_second=10, screen=True)
+
+            with live_ctx as live:
+                if self.automatic and self.headless_tui:
+                    print("Automatic demo collection started...")
+
                 while self.simulation_app.is_running() and not self.should_exit:
                     self.world.step(render=True)
 
@@ -1639,6 +1797,12 @@ class JetbotKeyboardController:
                         last_char_cmd = self._process_commands()
                         if last_char_cmd is not None:
                             last_key_processed = last_char_cmd
+
+                        # Autopilot velocity computation
+                        if self.automatic and self.auto_pilot is not None and self.current_obs is not None:
+                            linear_vel, angular_vel = self.auto_pilot.compute_action(self.current_obs)
+                            self.current_linear_vel = linear_vel
+                            self.current_angular_vel = angular_vel
 
                         # Apply current velocity control
                         self._apply_control()
@@ -1657,6 +1821,23 @@ class JetbotKeyboardController:
                             ], dtype=np.float32)
                             self._record_step(normalized_action)
 
+                        # Automatic episode management
+                        if self.automatic:
+                            self.auto_step_count += 1
+                            position, _ = self._get_robot_pose()
+                            goal_reached = self.scene_manager.check_goal_reached(position)
+
+                            if goal_reached:
+                                self._handle_auto_episode_end(True, "Goal reached")
+                            elif self._is_out_of_bounds(position):
+                                self._handle_auto_episode_end(False, "Out of bounds")
+                            elif self.auto_step_count >= self.auto_max_episode_steps:
+                                self._handle_auto_episode_end(False, "Timeout")
+
+                            # Check episode target
+                            if not self.continuous and self.auto_episode_count >= self.num_episodes:
+                                self.should_exit = True
+
                         # Checkpoint auto-save
                         if self.enable_recording and self.recorder is not None:
                             if self.recorder.is_recording:
@@ -1672,9 +1853,18 @@ class JetbotKeyboardController:
                         if self.enable_recording:
                             self.tui.set_checkpoint_flash(self.checkpoint_flash_frames > 0)
 
+                        # Update autopilot TUI status
+                        if self.automatic:
+                            progress = f"{self.auto_episode_count}" if self.continuous else f"{self.auto_episode_count}/{self.num_episodes}"
+                            self.tui.set_autopilot_status(True, progress)
+
                         # Update TUI state
                         self._update_tui_state()
-                        live.update(self.tui.render())
+
+                        if not self.headless_tui and live is not None:
+                            live.update(self.tui.render())
+                        elif self.headless_tui and self.automatic and self.auto_step_count % 100 == 0:
+                            print(f"  Step {self.auto_step_count}, Episodes: {self.auto_episode_count}")
 
         finally:
             # Cleanup camera streaming
@@ -1729,6 +1919,22 @@ def parse_args():
         '--camera-port', type=int, default=5600,
         help='UDP port for camera stream (default: 5600)'
     )
+    parser.add_argument(
+        '--automatic', action='store_true',
+        help='Enable autopilot mode for autonomous demo collection'
+    )
+    parser.add_argument(
+        '--num-episodes', type=int, default=100,
+        help='Number of episodes to collect in automatic mode (default: 100)'
+    )
+    parser.add_argument(
+        '--continuous', action='store_true',
+        help='Ignore --num-episodes, run until Esc'
+    )
+    parser.add_argument(
+        '--headless-tui', action='store_true',
+        help='Disable Rich TUI, use console progress prints'
+    )
     return parser.parse_args()
 
 
@@ -1740,6 +1946,10 @@ if __name__ == "__main__":
         reward_mode=args.reward_mode,
         num_obstacles=args.num_obstacles,
         enable_camera=not args.no_camera,
-        camera_port=args.camera_port
+        camera_port=args.camera_port,
+        automatic=args.automatic,
+        num_episodes=args.num_episodes,
+        continuous=args.continuous,
+        headless_tui=args.headless_tui
     )
     controller.run()
