@@ -60,6 +60,10 @@ def load_demo_data(filepath: str, successful_only: bool = False):
 def bc_warmstart(model, env, demo_path: str, epochs: int = 50, batch_size: int = 64):
     """Pretrain PPO policy using behavioral cloning from demonstrations.
 
+    Uses pure PyTorch to train the PPO actor network via MSE loss against
+    demonstration actions. Only actor parameters are updated (value network
+    is left untouched so PPO can learn its own value estimates).
+
     Args:
         model: SB3 PPO model to pretrain
         env: Gymnasium environment (for spaces)
@@ -67,45 +71,58 @@ def bc_warmstart(model, env, demo_path: str, epochs: int = 50, batch_size: int =
         epochs: Number of BC training epochs
         batch_size: BC training batch size
     """
-    try:
-        from imitation.algorithms import bc
-        from imitation.data import types
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
 
-        print("\n" + "=" * 60)
-        print("Behavioral Cloning Warmstart")
-        print("=" * 60)
+    print("\n" + "=" * 60)
+    print("Behavioral Cloning Warmstart (PyTorch)")
+    print("=" * 60)
 
-        # Load demo data
-        observations, actions = load_demo_data(demo_path)
+    # Load demo data
+    observations, actions = load_demo_data(demo_path)
 
-        # Create transitions dataset
-        transitions = types.TransitionsMinimal(
-            obs=observations,
-            acts=actions,
-            infos=np.array([{}] * len(observations))
-        )
+    # Build dataloader
+    dataset = TensorDataset(
+        torch.tensor(observations),
+        torch.tensor(actions),
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-        # Create BC trainer using the PPO's policy
-        rng = np.random.default_rng(42)
-        bc_trainer = bc.BC(
-            observation_space=env.observation_space,
-            action_space=env.action_space,
-            demonstrations=transitions,
-            policy=model.policy,
-            batch_size=batch_size,
-            rng=rng,
-        )
+    # Collect actor-only parameters (exclude value network)
+    policy = model.policy
+    actor_params = (
+        list(policy.features_extractor.parameters())
+        + list(policy.mlp_extractor.policy_net.parameters())
+        + list(policy.action_net.parameters())
+    )
+    optimizer = torch.optim.Adam(actor_params, lr=1e-3)
+    loss_fn = torch.nn.MSELoss()
+    device = policy.device
 
-        # Train
-        print(f"Pretraining policy for {epochs} epochs...")
-        bc_trainer.train(n_epochs=epochs)
-        print("BC warmstart complete!")
-        print("=" * 60 + "\n")
+    print(f"Pretraining policy for {epochs} epochs on {len(dataset)} transitions...")
 
-    except ImportError as e:
-        print(f"\nWarning: imitation library not available: {e}")
-        print("Skipping BC warmstart. Install with: pip install imitation")
-        print("Continuing with random policy initialization...\n")
+    for epoch in range(epochs):
+        total_loss = 0.0
+        n_batches = 0
+        for obs_batch, act_batch in loader:
+            obs_batch = obs_batch.to(device)
+            act_batch = act_batch.to(device)
+
+            pred_actions = policy.get_distribution(obs_batch).distribution.mean
+            loss = loss_fn(pred_actions, act_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:4d}/{epochs}, Loss: {total_loss / n_batches:.6f}")
+
+    print("BC warmstart complete!")
+    print("=" * 60 + "\n")
 
 
 def main():

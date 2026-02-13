@@ -22,7 +22,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 ### Python Dependencies
 
 ```bash
-~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 tensorboard gymnasium imitation
+~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 tensorboard gymnasium
 ```
 
 ### Camera Streaming Dependencies (Optional)
