@@ -435,7 +435,7 @@ class SceneManager:
             self.goal_marker = None
 
         if position is None:
-            position = self._random_position()
+            position = self._generate_safe_goal_position()
 
         self.goal_position = np.array(position)
         self.goal_counter += 1
@@ -468,8 +468,19 @@ class SceneManager:
             })()
             self.goal_marker = self.world.scene.add(marker_mock)
 
-        # Respawn obstacles after goal is set
-        self.spawn_obstacles()
+        # Respawn obstacles after goal is set, retrying if layout is unsolvable
+        goal_2d = self.goal_position[:2]
+        max_layout_attempts = 5
+        for attempt in range(max_layout_attempts):
+            self.spawn_obstacles()
+            # Verify A* path exists from start to goal
+            grid = OccupancyGrid.from_scene(
+                self.obstacle_metadata, self.workspace_bounds
+            )
+            path = astar_search(grid, (0.0, 0.0), (goal_2d[0], goal_2d[1]))
+            if path:
+                break
+            # Last attempt: keep the layout anyway (episode will truncate naturally)
 
         return self.goal_position
 
@@ -527,12 +538,14 @@ class SceneManager:
         self.obstacle_metadata = []
 
     def _generate_safe_position(self, min_distance_from_goal: float = 0.5,
-                                min_distance_from_start: float = 1.0) -> list:
-        """Generate a random position that is safe (not too close to goal or start).
+                                min_distance_from_start: float = 1.0,
+                                min_inter_obstacle_distance: float = 0.3) -> list:
+        """Generate a random position that is safe (not too close to goal, start, or other obstacles).
 
         Args:
             min_distance_from_goal: Minimum distance from goal position (meters)
             min_distance_from_start: Minimum distance from robot start position (meters)
+            min_inter_obstacle_distance: Minimum center-to-center distance from existing obstacles (meters)
 
         Returns:
             [x, y, z] position list that is safe
@@ -552,6 +565,15 @@ class SceneManager:
 
             # Check distance from robot start
             if np.linalg.norm(pos_2d - robot_start) < min_distance_from_start:
+                continue
+
+            # Check distance from existing obstacles
+            too_close = False
+            for obs_pos, _ in self.obstacle_metadata:
+                if np.linalg.norm(pos_2d - obs_pos) < min_inter_obstacle_distance:
+                    too_close = True
+                    break
+            if too_close:
                 continue
 
             return pos
@@ -660,6 +682,33 @@ class SceneManager:
         except ImportError:
             # Fall back to no obstacles for testing
             pass
+
+    def _generate_safe_goal_position(self, min_distance_from_start: float = 0.5) -> list:
+        """Generate a goal position that is not too close to the robot start.
+
+        Uses rejection sampling with a fallback to place the goal at exactly
+        min_distance_from_start in a random direction.
+
+        Args:
+            min_distance_from_start: Minimum distance from origin (meters)
+
+        Returns:
+            [x, y, z] position list
+        """
+        robot_start = np.array([0.0, 0.0])
+        max_attempts = 50
+
+        for _ in range(max_attempts):
+            pos = self._random_position()
+            pos_2d = np.array(pos[:2])
+            if np.linalg.norm(pos_2d - robot_start) >= min_distance_from_start:
+                return pos
+
+        # Fallback: place at exactly min_distance_from_start in a random direction
+        angle = np.random.uniform(0, 2 * np.pi)
+        x = min_distance_from_start * np.cos(angle)
+        y = min_distance_from_start * np.sin(angle)
+        return [x, y, 0.01]
 
     def _random_position(self) -> list:
         """Generate a random position within workspace bounds.

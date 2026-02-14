@@ -253,10 +253,16 @@ class JetbotNavigationEnv(gymnasium.Env):
         """
         super().reset(seed=seed)
 
-        # Reset robot to start position
+        # Randomize start heading for domain randomization
+        yaw = self.np_random.uniform(0, 2 * np.pi)
+        orientation = np.array([
+            np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)
+        ])  # quaternion (w, x, y, z)
+
+        # Reset robot to start position with random heading
         self.jetbot.set_world_pose(
             position=self.START_POSITION,
-            orientation=self.START_ORIENTATION
+            orientation=orientation
         )
 
         # Reset velocities
