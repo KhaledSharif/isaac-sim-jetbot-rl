@@ -398,6 +398,96 @@ def normalize_returns(returns: np.ndarray, env) -> np.ndarray:
     ).astype(np.float32)
 
 
+class VerboseEpisodeCallback:
+    """Prints episode stats at each episode boundary during training.
+
+    Instantiated after deferred imports provide BaseCallback.
+    Use create() classmethod inside main() after imports are available.
+    """
+
+    @staticmethod
+    def create(base_callback_cls):
+        """Create callback class using the imported BaseCallback."""
+
+        class _VerboseEpisodeCallback(base_callback_cls):
+            def __init__(self):
+                super().__init__(verbose=0)
+                self._ep_count = 0
+                self._ep_reward = 0.0
+                self._ep_steps = 0
+                self._ep_min_lidar = float('inf')
+                self._total_successes = 0
+                self._total_collisions = 0
+                self._total_truncations = 0
+
+            def _on_step(self):
+                infos = self.locals.get('infos', [{}])
+                rewards = self.locals.get('rewards', [0.0])
+                dones = self.locals.get('dones', [False])
+
+                for i in range(len(dones)):
+                    info = infos[i] if i < len(infos) else {}
+                    reward = float(rewards[i]) if i < len(rewards) else 0.0
+
+                    self._ep_reward += reward
+                    self._ep_steps += 1
+
+                    min_lid = info.get('min_lidar_distance', float('inf'))
+                    if min_lid < self._ep_min_lidar:
+                        self._ep_min_lidar = min_lid
+
+                    if dones[i]:
+                        self._ep_count += 1
+                        success = info.get('is_success', False)
+                        collision = info.get('collision', False)
+
+                        if success:
+                            self._total_successes += 1
+                            outcome = "SUCCESS"
+                        elif collision:
+                            self._total_collisions += 1
+                            outcome = "COLLISION"
+                        else:
+                            self._total_truncations += 1
+                            outcome = "TRUNCATED"
+
+                        sr = self._total_successes / self._ep_count * 100
+
+                        # End of episode summary
+                        print(
+                            f"[EP {self._ep_count:4d} END]  "
+                            f"{outcome:>9s} | "
+                            f"steps={self._ep_steps:3d} | "
+                            f"return={self._ep_reward:+7.2f} | "
+                            f"min_lidar={self._ep_min_lidar:.3f}m | "
+                            f"running SR={sr:.1f}% "
+                            f"({self._total_successes}S/{self._total_collisions}C/{self._total_truncations}T)"
+                        )
+
+                        # Start of next episode info (from the auto-reset obs)
+                        new_obs = self.locals.get('new_obs')
+                        if new_obs is not None:
+                            obs = new_obs[i] if len(new_obs) > i else new_obs[0]
+                            goal_x, goal_y = obs[5], obs[6]
+                            dist = obs[7]
+                            heading_deg = float(np.degrees(obs[2]))
+                            print(
+                                f"[EP {self._ep_count + 1:4d} START] "
+                                f"goal=({goal_x:+.2f}, {goal_y:+.2f}) | "
+                                f"dist={dist:.2f}m | "
+                                f"heading={heading_deg:+.1f}deg"
+                            )
+
+                        # Reset per-episode trackers
+                        self._ep_reward = 0.0
+                        self._ep_steps = 0
+                        self._ep_min_lidar = float('inf')
+
+                return True
+
+        return _VerboseEpisodeCallback()
+
+
 class SaveVecNormalizeCallback:
     """Saves VecNormalize statistics alongside model checkpoints.
 
@@ -460,6 +550,8 @@ Examples:
                         help='Run without GUI (faster training)')
     parser.add_argument('--num-obstacles', type=int, default=5,
                         help='Number of obstacles to spawn (default: 5)')
+    parser.add_argument('--arena-size', type=float, default=4.0,
+                        help='Side length of square arena in meters (default: 4.0)')
     parser.add_argument('--cpu', action='store_true',
                         help='Force training on CPU instead of GPU')
 
@@ -474,6 +566,10 @@ Examples:
     # Checkpoint arguments
     parser.add_argument('--checkpoint-freq', type=int, default=10000,
                         help='Save checkpoint every N steps (default: 10000)')
+
+    # Logging arguments
+    parser.add_argument('--verbose', action='store_true',
+                        help='Print per-episode stats (outcome, return, lidar, goal)')
 
     # Output arguments
     parser.add_argument('--output', type=str, default='models/ppo_jetbot.zip',
@@ -506,10 +602,13 @@ Examples:
 
     # Create environment
     print("Creating environment...")
+    half = args.arena_size / 2.0
+    workspace_bounds = {'x': [-half, half], 'y': [-half, half]}
     raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
         headless=args.headless,
         num_obstacles=args.num_obstacles,
+        workspace_bounds=workspace_bounds,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space: {raw_env.action_space.shape}")
@@ -539,7 +638,7 @@ Examples:
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.001,
-        target_kl=0.02,
+        target_kl=0.1,
         policy_kwargs=dict(
             net_arch=dict(pi=[256, 256], vf=[256, 256]),
             activation_fn=torch.nn.Tanh,
@@ -574,9 +673,9 @@ Examples:
             batch_size=args.bc_batch_size,
         )
 
-        # Tighten exploration noise after BC warmstart (std ~ 0.135)
-        model.policy.log_std.data.fill_(-2.0)
-        print("log_std tightened to -2.0 (std ~ 0.135) after BC warmstart")
+        # Tighten exploration noise after BC warmstart (std ~ 0.368)
+        model.policy.log_std.data.fill_(-1.0)
+        print("log_std tightened to -1.0 (std ~ 0.368) after BC warmstart")
 
     # Create checkpoint callbacks
     checkpoint_dir = Path(args.output).parent / "checkpoints"
@@ -594,7 +693,10 @@ Examples:
         save_path=str(checkpoint_dir),
         verbose=1,
     )
-    callback = CallbackList([checkpoint_callback, vecnorm_callback])
+    callbacks = [checkpoint_callback, vecnorm_callback]
+    if args.verbose:
+        callbacks.append(VerboseEpisodeCallback.create(BaseCallback))
+    callback = CallbackList(callbacks)
 
     # Train
     print("\n" + "=" * 60)

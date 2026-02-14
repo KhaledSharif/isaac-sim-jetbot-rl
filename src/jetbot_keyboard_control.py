@@ -1693,7 +1693,7 @@ class JetbotKeyboardController:
                  enable_camera: bool = True, camera_port: int = 5600,
                  automatic: bool = False, num_episodes: int = 100,
                  continuous: bool = False, headless_tui: bool = False,
-                 use_lidar: bool = False):
+                 use_lidar: bool = False, arena_size: float = 4.0):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1708,6 +1708,7 @@ class JetbotKeyboardController:
             continuous: Ignore num_episodes, run until Esc
             headless_tui: Disable Rich TUI, use console progress prints
             use_lidar: Enable LiDAR observations for 34D obs (default: False)
+            arena_size: Side length of square arena in meters (default: 4.0)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
@@ -1817,7 +1818,11 @@ class JetbotKeyboardController:
         self.checkpoint_flash_duration = 10
 
         # Initialize scene manager for goal spawning and obstacles
-        self.scene_manager = SceneManager(self.world, num_obstacles=num_obstacles)
+        half = arena_size / 2.0
+        workspace_bounds = {'x': [-half, half], 'y': [-half, half]}
+        self.scene_manager = SceneManager(
+            self.world, workspace_bounds=workspace_bounds, num_obstacles=num_obstacles
+        )
 
         # Initialize recording components if enabled
         if self.enable_recording:
@@ -2486,6 +2491,10 @@ def parse_args():
         help='Number of obstacles to spawn (default: 5)'
     )
     parser.add_argument(
+        '--arena-size', type=float, default=4.0,
+        help='Side length of square arena in meters (default: 4.0)'
+    )
+    parser.add_argument(
         '--no-camera', action='store_true',
         help='Disable camera streaming'
     )
@@ -2529,6 +2538,7 @@ if __name__ == "__main__":
         num_episodes=args.num_episodes,
         continuous=args.continuous,
         headless_tui=args.headless_tui,
-        use_lidar=args.use_lidar
+        use_lidar=args.use_lidar,
+        arena_size=args.arena_size,
     )
     controller.run()
