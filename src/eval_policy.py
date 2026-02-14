@@ -44,6 +44,8 @@ Examples:
                         help='Reward mode (default: dense)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
+    parser.add_argument('--vecnormalize', type=str, default=None, metavar='PKL_FILE',
+                        help='Path to VecNormalize stats .pkl file (auto-detected if not given)')
 
     args = parser.parse_args()
 
@@ -73,20 +75,41 @@ Examples:
     # Import here to allow --help without Isaac Sim
     from jetbot_rl_env import JetbotNavigationEnv
     from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
     # Create environment
     print("Creating environment...")
-    env = JetbotNavigationEnv(
+    raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
         headless=args.headless,
     )
-    print(f"  Observation space: {env.observation_space.shape}")
-    print(f"  Action space: {env.action_space.shape}")
+    print(f"  Observation space: {raw_env.observation_space.shape}")
+    print(f"  Action space: {raw_env.action_space.shape}")
+
+    # Wrap with VecNormalize if stats file exists
+    vec_env = DummyVecEnv([lambda: raw_env])
+
+    # Auto-detect VecNormalize stats
+    vecnorm_path = None
+    if args.vecnormalize:
+        vecnorm_path = Path(args.vecnormalize)
+    else:
+        auto_path = policy_path.with_suffix('.pkl')
+        if auto_path.exists():
+            vecnorm_path = auto_path
+
+    if vecnorm_path and vecnorm_path.exists():
+        vec_env = VecNormalize.load(str(vecnorm_path), vec_env)
+        vec_env.training = False      # don't update running stats
+        vec_env.norm_reward = False   # raw rewards for metrics
+        print(f"  VecNormalize stats loaded from: {vecnorm_path}")
+    else:
+        print("  VecNormalize stats: not found (using raw observations)")
     print()
 
     # Load trained policy
     print(f"Loading policy from {args.policy_path}...")
-    model = PPO.load(args.policy_path)
+    model = PPO.load(args.policy_path, env=vec_env)
     print("Policy loaded successfully!\n")
 
     # Evaluation metrics
@@ -100,11 +123,10 @@ Examples:
     print("=" * 60)
 
     for episode in range(args.episodes):
-        # Reset environment
+        # Reset environment (VecEnv API: reset returns obs only)
         if args.seed is not None:
-            obs, info = env.reset(seed=args.seed + episode)
-        else:
-            obs, info = env.reset()
+            vec_env.seed(args.seed + episode)
+        obs = vec_env.reset()
 
         done = False
         episode_reward = 0.0
@@ -115,14 +137,14 @@ Examples:
             # Get action from policy
             action, _ = model.predict(obs, deterministic=deterministic)
 
-            # Step environment
-            obs, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
+            # Step environment (VecEnv API: returns arrays, infos is list of dicts)
+            obs, rewards, dones, infos = vec_env.step(action)
+            episode_reward += rewards[0]
             steps += 1
-            done = terminated or truncated
+            done = dones[0]
 
             # Check for goal reached
-            if info.get('goal_reached', False):
+            if infos[0].get('goal_reached', False):
                 goal_reached = True
 
         # Record episode results
@@ -156,7 +178,7 @@ Examples:
     print("=" * 60)
 
     # Return success rate as exit code (0-100)
-    env.close()
+    vec_env.close()
     return 0
 
 
