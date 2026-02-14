@@ -9,9 +9,10 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Camera Streaming**: GStreamer H264 RTP UDP streaming from Jetbot camera
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
-- **Automatic Demo Collection**: Autonomous data collection with noisy proportional controller
-- **RL Training Pipeline**: Train PPO agents with optional behavioral cloning warmstart
+- **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
+- **RL Training Pipeline**: PPO with BC warmstart, VecNormalize pre-warming, and critic pretraining
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
+- **LiDAR Sensing**: 24-ray analytical raycasting (180 FOV) for obstacle detection
 
 ## Requirements
 
@@ -154,15 +155,30 @@ isaac-sim-jetbot-keyboard/
 ### Training
 
 ```bash
-# Train PPO agent (headless for speed)
+# Train PPO agent from scratch (headless for speed)
 ./run.sh train_rl.py --headless --timesteps 500000
 
-# Train with behavioral cloning warmstart
+# Train with BC warmstart from demonstrations (recommended)
+./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
+
+# Train with GUI to watch the agent
 ./run.sh train_rl.py --bc-warmstart demos/recording.npz --timesteps 1000000
 
 # Train BC model only
 ./run.sh train_bc.py demos/recording.npz --epochs 100
 ```
+
+#### BC Warmstart Pipeline
+
+When `--bc-warmstart` is provided, the training script runs:
+
+1. **Validate** demo data (minimum episodes, transitions, successes)
+2. **Pre-warm VecNormalize** — seeds observation and reward normalization stats from demo data
+3. **BC warmstart** — pretrains the PPO actor on normalized demo observations
+4. **Critic pretraining** — pretrains the PPO value network on normalized Monte Carlo returns
+5. **PPO training** — fine-tunes with on-policy RL, VecNormalize stats consistent with pretraining
+
+The VecNormalize pre-warming step is critical: without it, the BC-learned policy sees differently-scaled observations during RL and loses its learned behavior.
 
 ### Evaluation
 
@@ -203,7 +219,7 @@ isaac-sim-jetbot-keyboard/
 ./run_tests.sh -k test_action_mapper
 ```
 
-## Observation Space (10D)
+## Observation Space (34D for RL, 10D base for teleoperation)
 
 | Index | Description | Range |
 |-------|-------------|-------|
@@ -215,6 +231,10 @@ isaac-sim-jetbot-keyboard/
 | 7 | Distance to goal | meters |
 | 8 | Angle to goal | radians |
 | 9 | Goal reached flag | 0 or 1 |
+| 10-33 | LiDAR distances (24 rays, 180 FOV) | 0.0 (touching) to 1.0 (max range) |
+
+The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR.
+The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 
 ## Action Space (2D)
 
@@ -226,13 +246,17 @@ isaac-sim-jetbot-keyboard/
 ## Reward Function
 
 ### Dense Mode (default)
-- Distance reward: Positive for getting closer to goal
-- Heading bonus: Reward for facing the goal
-- Goal reached: +10.0 bonus
+- **Goal reached**: +10.0 (terminal)
+- **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
+- **Distance shaping**: `(prev_dist - curr_dist) * 1.0` — reward for getting closer
+- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1` — reward for facing goal
+- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when near obstacles
+- **Time penalty**: -0.005 per step
 
 ### Sparse Mode
-- Goal reached: +10.0
-- Otherwise: 0.0
+- **Goal reached**: +10.0
+- **Collision**: -10.0
+- **Otherwise**: 0.0
 
 ## TensorBoard
 
@@ -252,7 +276,7 @@ tensorboard --logdir runs/
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming
-- **AutoPilot**: Noisy proportional controller for autonomous demo collection
+- **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
 
 ### Obstacle System
 

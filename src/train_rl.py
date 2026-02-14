@@ -85,8 +85,9 @@ def bc_warmstart(model, env, demo_path: str, epochs: int = 50, batch_size: int =
     print("Behavioral Cloning Warmstart (PyTorch)")
     print("=" * 60)
 
-    # Load demo data
+    # Load demo data and normalize observations to match VecNormalize
     observations, actions = load_demo_data(demo_path)
+    observations = normalize_obs(observations, env)
 
     # Build dataloader
     dataset = TensorDataset(
@@ -234,15 +235,20 @@ def compute_mc_returns(filepath: str, gamma: float = 0.99) -> np.ndarray:
     return returns
 
 
-def pretrain_critic(model, filepath: str, gamma: float = 0.99,
+def pretrain_critic(model, env, filepath: str, gamma: float = 0.99,
                     epochs: int = 50, batch_size: int = 64):
     """Pretrain PPO critic (value network) using Monte Carlo returns from demos.
 
     Trains only the critic parameters (value_net and mlp_extractor.value_net)
     to predict MC returns, giving the critic a meaningful initialization before RL.
 
+    Observations are normalized using VecNormalize's obs_rms and returns are
+    scaled by VecNormalize's ret_rms so the critic trains on the same scale
+    it will see during PPO training.
+
     Args:
         model: SB3 PPO model
+        env: VecNormalize-wrapped environment (for normalization stats)
         filepath: Path to demo .npz file
         gamma: Discount factor for MC returns
         epochs: Training epochs
@@ -255,11 +261,13 @@ def pretrain_critic(model, filepath: str, gamma: float = 0.99,
     print("Critic Pretraining (Monte Carlo Returns)")
     print("=" * 60)
 
-    # Compute MC returns
+    # Compute MC returns and normalize to VecNormalize reward scale
     mc_returns = compute_mc_returns(filepath, gamma)
+    mc_returns = normalize_returns(mc_returns, env)
 
-    # Load observations
+    # Load observations and normalize to VecNormalize obs scale
     observations, _ = load_demo_data(filepath)
+    observations = normalize_obs(observations, env)
 
     # Build dataset
     dataset = TensorDataset(
@@ -306,6 +314,88 @@ def pretrain_critic(model, filepath: str, gamma: float = 0.99,
 
     print("Critic pretraining complete!")
     print("=" * 60 + "\n")
+
+
+def prewarm_vecnormalize(env, demo_path: str, gamma: float = 0.99):
+    """Pre-warm VecNormalize running statistics from demonstration data.
+
+    Feeds demo observations and simulated discounted returns through
+    VecNormalize's RunningMeanStd so that normalization during RL matches
+    the distribution used for BC and critic pretraining.
+
+    Args:
+        env: VecNormalize-wrapped environment
+        demo_path: Path to demo .npz file
+        gamma: Discount factor (must match PPO gamma)
+    """
+    data = np.load(demo_path, allow_pickle=True)
+    observations = data['observations'].astype(np.float32)
+    rewards = data['rewards'].astype(np.float32)
+    episode_lengths = data['episode_lengths']
+
+    # Pre-warm observation running stats
+    env.obs_rms.update(observations)
+
+    # Simulate VecNormalize's return accumulation (self.returns * gamma + reward)
+    # to pre-warm ret_rms with the correct variance estimate
+    running_returns = []
+    offset = 0
+    for length in episode_lengths:
+        ret = 0.0
+        for t in range(int(length)):
+            ret = ret * gamma + rewards[offset + t]
+            running_returns.append(ret)
+        offset += int(length)
+
+    env.ret_rms.update(np.array(running_returns))
+
+    print("\n" + "=" * 60)
+    print("VecNormalize Pre-warmed from Demo Data")
+    print("=" * 60)
+    obs_std = np.sqrt(env.obs_rms.var)
+    print(f"  Observations: {len(observations)} samples")
+    print(f"  obs_rms mean range: [{env.obs_rms.mean.min():.3f}, {env.obs_rms.mean.max():.3f}]")
+    print(f"  obs_rms std range:  [{obs_std.min():.3f}, {obs_std.max():.3f}]")
+    print(f"  ret_rms std: {np.sqrt(env.ret_rms.var):.3f}")
+    print("=" * 60 + "\n")
+
+
+def normalize_obs(observations: np.ndarray, env) -> np.ndarray:
+    """Normalize observations using VecNormalize's running stats.
+
+    Applies the same (obs - mean) / std transformation and clipping
+    that VecNormalize applies during RL rollouts.
+
+    Args:
+        observations: Raw observations array (N, obs_dim)
+        env: VecNormalize-wrapped environment
+
+    Returns:
+        Normalized observations as float32 array
+    """
+    return np.clip(
+        (observations - env.obs_rms.mean) / np.sqrt(env.obs_rms.var + env.epsilon),
+        -env.clip_obs, env.clip_obs,
+    ).astype(np.float32)
+
+
+def normalize_returns(returns: np.ndarray, env) -> np.ndarray:
+    """Normalize returns using VecNormalize's reward normalization.
+
+    VecNormalize divides rewards by sqrt(ret_rms.var) (no mean subtraction).
+    Apply the same scaling to MC returns for critic pretraining.
+
+    Args:
+        returns: Raw MC returns array (N,)
+        env: VecNormalize-wrapped environment
+
+    Returns:
+        Normalized returns as float32 array
+    """
+    return np.clip(
+        returns / np.sqrt(env.ret_rms.var + env.epsilon),
+        -env.clip_reward, env.clip_reward,
+    ).astype(np.float32)
 
 
 class SaveVecNormalizeCallback:
@@ -456,6 +546,10 @@ Examples:
         # Validate demo data first (fail fast)
         validate_demo_data(args.bc_warmstart)
 
+        # Pre-warm VecNormalize stats from demo data so BC and critic
+        # pretraining use the same observation/reward scale as PPO
+        prewarm_vecnormalize(env, args.bc_warmstart, gamma=0.99)
+
         # Pretrain actor via behavioral cloning
         bc_warmstart(
             model, env,
@@ -466,7 +560,7 @@ Examples:
 
         # Pretrain critic via Monte Carlo returns
         pretrain_critic(
-            model,
+            model, env,
             filepath=args.bc_warmstart,
             gamma=0.99,
             epochs=args.bc_epochs,

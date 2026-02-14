@@ -22,8 +22,13 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - Navigation task: drive to goal position
    - Dense/sparse reward modes
 
-3. **Supporting Scripts**
-   - `train_rl.py` - PPO training with optional BC warmstart
+3. **Training Pipeline** (`src/train_rl.py`)
+   - PPO training with BC warmstart from demonstrations
+   - VecNormalize pre-warming from demo data (critical for BC→RL transfer)
+   - Critic pretraining on Monte Carlo returns
+   - Pipeline: validate → prewarm VecNormalize → BC warmstart → critic pretrain → PPO
+
+4. **Supporting Scripts**
    - `eval_policy.py` - Policy evaluation and metrics
    - `train_bc.py` - Behavioral cloning from demonstrations
    - `replay.py` - Demo playback and inspection
@@ -41,6 +46,14 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
 - **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
+
+### Training Pipeline Functions (`src/train_rl.py`)
+
+- **prewarm_vecnormalize()**: Seeds VecNormalize's `obs_rms` and `ret_rms` running statistics from demo data so BC/critic pretraining operates on the same normalized scale as PPO
+- **normalize_obs()**: Applies `(obs - mean) / std` clipped to `[-clip_obs, clip_obs]`, matching VecNormalize's transform
+- **normalize_returns()**: Applies `returns / std` clipped to `[-clip_reward, clip_reward]`, matching VecNormalize's reward normalization (no mean subtraction)
+- **bc_warmstart()**: Pretrains PPO actor on normalized demo observations via MSE loss
+- **pretrain_critic()**: Pretrains PPO critic on normalized observations and scaled MC returns
 
 ## Keyboard Controls
 
@@ -121,8 +134,11 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # Note: --automatic now forces --use-lidar automatically
 ./run.sh --enable-recording --automatic --use-lidar
 
-# Training
+# Training (from scratch)
 ./run.sh train_rl.py --headless --timesteps 500000
+
+# Training with BC warmstart (recommended)
+./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
 # Evaluation
 ./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
@@ -159,6 +175,24 @@ isaac-sim-jetbot-keyboard/
 - `DifferentialController` for wheel velocity conversion
 - SimulationApp must be instantiated FIRST before any Isaac imports
 
+## BC → PPO Normalization (Critical Design Constraint)
+
+The RL training pipeline uses SB3's `VecNormalize` to z-score normalize observations and scale rewards at runtime. When using BC warmstart, the demo data must be normalized to the **same scale** the policy will see during PPO training. Failing to do this destroys the BC-learned policy at the RL transition.
+
+**Required pipeline order:**
+1. Create VecNormalize-wrapped env
+2. `prewarm_vecnormalize()` — seed `obs_rms`/`ret_rms` from demo data
+3. `bc_warmstart()` — train actor on **normalized** demo observations
+4. `pretrain_critic()` — train critic on **normalized** observations and **scaled** MC returns
+5. `model.learn()` — VecNormalize stats are consistent with pretraining
+
+**What goes wrong without pre-warming:**
+- BC trains on raw obs (e.g., position ±2m), but PPO feeds normalized obs (~±1σ) — policy outputs garbage
+- Critic predicts raw-scale values (~40) but sees normalized rewards (~±1) — advantage estimates explode
+- KL divergence spikes → early stopping throttles learning → exploration freezes
+
+**Key rule:** Any function that feeds observations/returns to the policy or critic network must normalize them using VecNormalize's running stats first.
+
 ## Testing
 
 Tests use pytest with mocked Isaac Sim imports:
@@ -167,6 +201,21 @@ Tests use pytest with mocked Isaac Sim imports:
 ./run_tests.sh -v        # Verbose
 ./run_tests.sh -k name   # Specific test
 ```
+
+## Reward Function
+
+### Dense Mode (default)
+- **Goal reached**: +10.0 (terminal)
+- **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
+- **Distance shaping**: `(prev_dist - curr_dist) * 1.0`
+- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1`
+- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m
+- **Time penalty**: -0.005 per step
+
+### Sparse Mode
+- **Goal reached**: +10.0
+- **Collision**: -10.0
+- **Otherwise**: 0.0
 
 ## Dependencies
 
