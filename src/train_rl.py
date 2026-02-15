@@ -554,6 +554,8 @@ Examples:
                         help='Side length of square arena in meters (default: 4.0)')
     parser.add_argument('--cpu', action='store_true',
                         help='Force training on CPU instead of GPU')
+    parser.add_argument('--max-steps', type=int, default=500,
+                        help='Maximum steps per episode (default: 500)')
 
     # BC warmstart arguments
     parser.add_argument('--bc-warmstart', type=str, metavar='DEMO_FILE',
@@ -586,6 +588,7 @@ Examples:
     print(f"  Reward mode: {args.reward_mode}")
     print(f"  Headless: {args.headless}")
     print(f"  Seed: {args.seed}")
+    print(f"  Max steps/episode: {args.max_steps}")
     if args.bc_warmstart:
         print(f"  BC warmstart: {args.bc_warmstart}")
         print(f"  BC epochs: {args.bc_epochs}")
@@ -609,6 +612,7 @@ Examples:
         headless=args.headless,
         num_obstacles=args.num_obstacles,
         workspace_bounds=workspace_bounds,
+        max_episode_steps=args.max_steps,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space: {raw_env.action_space.shape}")

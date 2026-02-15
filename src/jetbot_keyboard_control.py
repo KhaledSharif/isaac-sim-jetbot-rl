@@ -1693,7 +1693,8 @@ class JetbotKeyboardController:
                  enable_camera: bool = True, camera_port: int = 5600,
                  automatic: bool = False, num_episodes: int = 100,
                  continuous: bool = False, headless_tui: bool = False,
-                 use_lidar: bool = False, arena_size: float = 4.0):
+                 use_lidar: bool = False, arena_size: float = 4.0,
+                 max_steps: int = 500):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1709,6 +1710,7 @@ class JetbotKeyboardController:
             headless_tui: Disable Rich TUI, use console progress prints
             use_lidar: Enable LiDAR observations for 34D obs (default: False)
             arena_size: Side length of square arena in meters (default: 4.0)
+            max_steps: Maximum steps per episode (default: 500)
         """
         # Create SimulationApp if not already created (e.g., by tests)
         global simulation_app, World, ArticulationAction, WheeledRobot
@@ -1845,7 +1847,7 @@ class JetbotKeyboardController:
         ) if automatic else None
         self.auto_episode_count = 0
         self.auto_step_count = 0
-        self.auto_max_episode_steps = 500
+        self.auto_max_episode_steps = max_steps
 
         # Force-enable recording when automatic mode is set
         if self.automatic and not self.enable_recording:
@@ -2522,6 +2524,10 @@ def parse_args():
         '--use-lidar', action='store_true',
         help='Enable LiDAR observations (34D obs instead of 10D)'
     )
+    parser.add_argument(
+        '--max-steps', type=int, default=500,
+        help='Maximum steps per episode (default: 500)'
+    )
     return parser.parse_args()
 
 
@@ -2540,5 +2546,6 @@ if __name__ == "__main__":
         headless_tui=args.headless_tui,
         use_lidar=args.use_lidar,
         arena_size=args.arena_size,
+        max_steps=args.max_steps,
     )
     controller.run()
