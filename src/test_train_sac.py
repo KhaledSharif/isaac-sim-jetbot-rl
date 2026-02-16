@@ -54,6 +54,11 @@ from train_sac import (
     validate_demo_data,
     load_demo_transitions,
     inject_layernorm_into_critics,
+    symlog,
+    LidarMLPVAE,
+    pretrain_lidar_vae,
+    LidarVAEFeatureExtractor,
+    bc_warmstart_sac,
 )
 
 
@@ -405,3 +410,222 @@ class TestInjectLayernorm:
             net = getattr(model.critic, f'qf{i}')
             assert self._count_layernorms(net) == 2, f"qf{i}: expected 2 LayerNorm"
             assert self._count_ofn(net) == 1, f"qf{i}: expected 1 OFN"
+
+
+# ============================================================================
+# TEST SUITE: Symlog
+# ============================================================================
+
+class TestSymlog:
+    def test_near_identity_at_zero(self):
+        """symlog(0) == 0."""
+        import torch
+        x = torch.tensor([0.0])
+        result = symlog(x)
+        assert result.item() == pytest.approx(0.0, abs=1e-7)
+
+    def test_compression_at_large_values(self):
+        """Large values are compressed: |symlog(100)| < 100."""
+        import torch
+        x = torch.tensor([100.0])
+        result = symlog(x)
+        assert 0 < result.item() < 100.0
+
+    def test_symmetry(self):
+        """symlog(-x) == -symlog(x)."""
+        import torch
+        x = torch.tensor([1.0, 5.0, 10.0])
+        assert torch.allclose(symlog(-x), -symlog(x))
+
+    def test_lidar_range_preservation(self):
+        """LiDAR values [0, 1] are nearly preserved (near-identity region)."""
+        import torch
+        x = torch.linspace(0, 1, 100)
+        result = symlog(x)
+        # symlog(x) = sign(x)*log(|x|+1) ≈ x for small x
+        # For x=1: symlog(1) = log(2) ≈ 0.693, so values are compressed but close
+        assert torch.all(result >= 0)
+        assert torch.all(result <= 1.0)  # log(2) ≈ 0.693 < 1.0
+
+
+# ============================================================================
+# TEST SUITE: LidarMLPVAE
+# ============================================================================
+
+class TestLidarMLPVAE:
+    def test_output_shapes(self):
+        """Forward pass returns correct shapes for z, mu, logvar, recon."""
+        import torch
+        vae = LidarMLPVAE.create()
+        x = torch.randn(8, 24)
+        z, mu, logvar, recon = vae(x)
+        assert z.shape == (8, 16)
+        assert mu.shape == (8, 16)
+        assert logvar.shape == (8, 16)
+        assert recon.shape == (8, 24)
+
+    def test_encode_shapes(self):
+        """Encode returns (mu, logvar) with correct shapes."""
+        import torch
+        vae = LidarMLPVAE.create()
+        x = torch.randn(4, 24)
+        mu, logvar = vae.encode(x)
+        assert mu.shape == (4, 16)
+        assert logvar.shape == (4, 16)
+
+    def test_decode_shapes(self):
+        """Decode returns reconstruction with correct shape."""
+        import torch
+        vae = LidarMLPVAE.create()
+        z = torch.randn(4, 16)
+        recon = vae.decode(z)
+        assert recon.shape == (4, 24)
+
+    def test_deterministic_eval(self):
+        """In eval mode, reparameterize returns mu (deterministic)."""
+        import torch
+        vae = LidarMLPVAE.create()
+        vae.eval()
+        x = torch.randn(4, 24)
+        z1, mu1, _, _ = vae(x)
+        z2, mu2, _, _ = vae(x)
+        torch.testing.assert_close(z1, z2)
+        torch.testing.assert_close(z1, mu1)
+
+    def test_stochastic_train(self):
+        """In train mode, reparameterize is stochastic (z != mu with high probability)."""
+        import torch
+        vae = LidarMLPVAE.create()
+        vae.train()
+        x = torch.randn(32, 24)
+        z, mu, _, _ = vae(x)
+        # With 32 samples and 16 latent dims, z should differ from mu
+        assert not torch.allclose(z, mu, atol=1e-6)
+
+    def test_custom_dims(self):
+        """Custom input_dim, hidden_dim, latent_dim work correctly."""
+        import torch
+        vae = LidarMLPVAE.create(input_dim=12, hidden_dim=64, latent_dim=8)
+        x = torch.randn(4, 12)
+        z, mu, logvar, recon = vae(x)
+        assert z.shape == (4, 8)
+        assert recon.shape == (4, 12)
+
+
+# ============================================================================
+# TEST SUITE: PretrainLidarVAE
+# ============================================================================
+
+class TestPretrainLidarVAE:
+    def test_returns_eval_mode_vae(self):
+        """Pretrained VAE is returned in eval mode."""
+        demo_obs = np.random.randn(200, 34).astype(np.float32)
+        vae = pretrain_lidar_vae(demo_obs, epochs=5, batch_size=64)
+        assert not vae.training
+
+    def test_reconstruction_improves(self):
+        """Reconstruction loss decreases over training."""
+        import torch
+        demo_obs = np.random.randn(500, 34).astype(np.float32)
+        # Untrained VAE
+        vae_untrained = LidarMLPVAE.create()
+        vae_untrained.eval()
+        lidar = symlog(torch.tensor(demo_obs[:, 10:34]))
+        with torch.no_grad():
+            _, _, _, recon_before = vae_untrained(lidar)
+            loss_before = torch.nn.functional.mse_loss(recon_before, lidar).item()
+
+        # Trained VAE
+        vae_trained = pretrain_lidar_vae(demo_obs, vae=LidarMLPVAE.create(), epochs=50, batch_size=64)
+        with torch.no_grad():
+            _, _, _, recon_after = vae_trained(lidar)
+            loss_after = torch.nn.functional.mse_loss(recon_after, lidar).item()
+
+        assert loss_after < loss_before, \
+            f"Reconstruction should improve: {loss_after:.4f} >= {loss_before:.4f}"
+
+    def test_accepts_prebuilt_vae(self):
+        """Can pass in a pre-built VAE to pretrain."""
+        demo_obs = np.random.randn(200, 34).astype(np.float32)
+        vae = LidarMLPVAE.create(latent_dim=8)
+        result = pretrain_lidar_vae(demo_obs, vae=vae, epochs=5, batch_size=64)
+        assert result is vae
+        assert result.latent_dim == 8
+
+
+# ============================================================================
+# TEST SUITE: LidarVAEFeatureExtractor
+# ============================================================================
+
+class TestLidarVAEFeatureExtractor:
+    def _make_extractor(self, pretrained_vae=None):
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+        obs_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+        cls = LidarVAEFeatureExtractor.create(BaseFeaturesExtractor)
+        return cls(obs_space, features_dim=48, pretrained_vae=pretrained_vae)
+
+    def test_output_shape(self):
+        """Feature extractor produces 48D output from 34D input."""
+        import torch
+        ext = self._make_extractor()
+        obs = torch.randn(8, 34)
+        out = ext(obs)
+        assert out.shape == (8, 48)
+
+    def test_features_dim(self):
+        """features_dim attribute is 48."""
+        ext = self._make_extractor()
+        assert ext.features_dim == 48
+
+    def test_pretrained_weights(self):
+        """Pretrained VAE weights are used when provided."""
+        import torch
+        vae = LidarMLPVAE.create()
+        # Set a known weight
+        vae.mu_head.bias.data.fill_(42.0)
+        ext = self._make_extractor(pretrained_vae=vae)
+        torch.testing.assert_close(
+            ext.vae.mu_head.bias.data,
+            torch.full_like(ext.vae.mu_head.bias.data, 42.0)
+        )
+
+    def test_eval_determinism(self):
+        """In eval mode, same input produces same output."""
+        import torch
+        ext = self._make_extractor()
+        ext.eval()
+        obs = torch.randn(4, 34)
+        out1 = ext(obs)
+        out2 = ext(obs)
+        torch.testing.assert_close(out1, out2)
+
+    def test_gradient_flow(self):
+        """Gradients flow through the feature extractor."""
+        import torch
+        ext = self._make_extractor()
+        ext.train()
+        obs = torch.randn(4, 34, requires_grad=False)
+        out = ext(obs)
+        loss = out.sum()
+        loss.backward()
+        # Check that state MLP has gradients
+        assert ext.state_mlp[0].weight.grad is not None
+        # Check that VAE encoder has gradients
+        assert ext.vae.mu_head.weight.grad is not None
+
+
+# ============================================================================
+# TEST SUITE: BCWarmstartWithFeatureExtractor
+# ============================================================================
+
+class TestBCWarmstartWithFeatureExtractor:
+    def test_include_feature_extractor_param_exists(self):
+        """bc_warmstart_sac accepts include_feature_extractor parameter."""
+        import inspect
+        sig = inspect.signature(bc_warmstart_sac)
+        assert 'include_feature_extractor' in sig.parameters
+        # Default should be False
+        assert sig.parameters['include_feature_extractor'].default is False

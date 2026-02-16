@@ -11,6 +11,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
 - **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with RLPD-style demo replay
+- **LiDAR MLP-VAE**: Optional DreamerV3-style VAE for compressed LiDAR latent representations
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
 - **LiDAR Sensing**: 24-ray analytical raycasting (180 FOV) for obstacle detection
 
@@ -166,6 +167,13 @@ isaac-sim-jetbot-keyboard/
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000 \
   --num-obstacles 50 --arena-size 8 --max-steps 1000 --utd-ratio 5
 
+# SAC/TQC with LiDAR MLP-VAE (DreamerV3-style latent compression)
+./run.sh train_sac.py --demos demos/recording.npz --headless --lidar-mlp-vae
+
+# LiDAR MLP-VAE with custom VAE hyperparameters
+./run.sh train_sac.py --demos demos/recording.npz --headless --lidar-mlp-vae \
+  --vae-epochs 200 --vae-beta 0.05 --vae-aux-freq 5 --vae-aux-lr 1e-4
+
 # PPO with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
@@ -178,6 +186,25 @@ isaac-sim-jetbot-keyboard/
 The `train_sac.py` script uses TQC (Truncated Quantile Critics) with RLPD-style 50/50 demo/online replay buffer sampling. No pretraining phases needed — demos are sampled continuously during training. LayerNorm in critics replaces VecNormalize.
 
 Key parameter: `--utd-ratio` controls gradient steps per env step (default 20). Higher UTD = better sample efficiency but slower wall-clock time. See [Training Performance](#training-performance) below.
+
+#### LiDAR MLP-VAE (Optional)
+
+When `--lidar-mlp-vae` is enabled, a DreamerV3-style MLP-VAE preprocesses LiDAR observations into a compressed 16D latent space before feeding into the actor/critic networks:
+
+```
+34D obs -> split -> [state 0:10]  -> symlog -> MLP(10->64->32)  -> concat -> 48D -> actor/critic
+                    [lidar 10:34] -> symlog -> VAE enc(24->128->64->16D) /
+```
+
+The pipeline: pretrain VAE on demo LiDAR data, inject pretrained weights into the SB3 model, BC warmstart with feature extractor, then train with an auxiliary VAE reconstruction+KL loss. TensorBoard logs `vae/recon_loss`, `vae/kl_loss`, and `vae/total_loss`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lidar-mlp-vae` | off | Enable VAE feature extractor |
+| `--vae-epochs` | 100 | VAE pretraining epochs |
+| `--vae-beta` | 0.1 | KL divergence weight |
+| `--vae-aux-freq` | 10 | Auxiliary loss frequency (steps) |
+| `--vae-aux-lr` | 1e-4 | Auxiliary loss learning rate |
 
 #### PPO + BC Warmstart Pipeline
 

@@ -97,6 +97,7 @@ Examples:
     print("=" * 60 + "\n")
 
     # Import here to allow --help without Isaac Sim
+    import train_sac  # noqa: F401 — registers LidarVAEFeatureExtractor for model deserialization
     from jetbot_rl_env import JetbotNavigationEnv
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
