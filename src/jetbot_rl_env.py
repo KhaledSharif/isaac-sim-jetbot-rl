@@ -179,7 +179,19 @@ class JetbotNavigationEnv(gymnasium.Env):
 
         # Create SimulationApp if not already created
         if simulation_app is None:
-            simulation_app = SimulationApp({"headless": self.headless})
+            config = {"headless": self.headless}
+            if self.headless:
+                config["disable_viewport_updates"] = True
+                config["anti_aliasing"] = 0
+                config["samples_per_pixel_per_frame"] = 1
+            simulation_app = SimulationApp(config)
+
+            # Disable rendering subsystems in headless mode
+            if self.headless:
+                import carb
+                settings = carb.settings.get_settings()
+                settings.set_bool("/rtx-transient/resourcemanager/texturestreaming/enabled", False)
+                settings.set_int("/persistent/physics/numThreads", 0)  # Single-threaded (faster for 1 robot)
         self.simulation_app = simulation_app
 
         # Import Isaac Sim modules after SimulationApp is created
@@ -196,8 +208,15 @@ class JetbotNavigationEnv(gymnasium.Env):
             DifferentialController = _DifferentialController
             get_assets_root_path = _get_assets_root_path
 
-        # Create world
-        self.world = World(stage_units_in_meters=1.0)
+        # Create world — decouple rendering from physics in headless mode
+        if self.headless:
+            self.world = World(
+                stage_units_in_meters=1.0,
+                physics_dt=1.0 / 60.0,
+                rendering_dt=1.0,  # Effectively never render
+            )
+        else:
+            self.world = World(stage_units_in_meters=1.0)
 
         # Get assets root path
         assets_root = get_assets_root_path()
@@ -227,6 +246,32 @@ class JetbotNavigationEnv(gymnasium.Env):
 
         # Reset world to initialize physics
         self.world.reset()
+
+        # Optimize physics scene for RL training (single robot, flat ground)
+        if self.headless:
+            self._optimize_physics_scene()
+
+    def _optimize_physics_scene(self):
+        """Tune PhysX scene for single-robot RL: CPU broadphase, fewer solver iters."""
+        try:
+            from pxr import UsdPhysics, PhysxSchema
+            stage = self.world.stage
+            for prim in stage.Traverse():
+                if prim.HasAPI(UsdPhysics.Scene):
+                    physx_api = PhysxSchema.PhysxSceneAPI.Apply(prim)
+                    # CPU dynamics is faster for single-robot scenes (no GPU transfer)
+                    physx_api.GetEnableGPUDynamicsAttr().Set(False)
+                    # MBP broadphase is better for small, static scenes
+                    physx_api.GetBroadphaseTypeAttr().Set("MBP")
+                    # Minimal solver iterations (flat ground + differential drive)
+                    physx_api.GetMinPositionIterationCountAttr().Set(1)
+                    physx_api.GetMaxPositionIterationCountAttr().Set(2)
+                    physx_api.GetMinVelocityIterationCountAttr().Set(0)
+                    physx_api.GetMaxVelocityIterationCountAttr().Set(1)
+                    print("  Physics scene optimized: CPU dynamics, MBP broadphase, reduced solver iters")
+                    break
+        except Exception as e:
+            print(f"  Warning: Could not optimize physics scene: {e}")
 
     def _get_robot_pose(self) -> tuple:
         """Get current robot position and heading.
@@ -277,7 +322,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.scene_manager.reset_goal()
 
         # Step simulation to settle physics
-        for _ in range(10):
+        for _ in range(2):
             self.world.step(render=not self.headless)
 
         # Reset tracking state

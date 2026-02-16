@@ -25,6 +25,7 @@ REM Check if first arg ends in .py
 echo %ARG1%| findstr /i "\.py$" >nul 2>&1
 if errorlevel 1 goto run_default
 
+
 REM First arg is a .py file - run that script with remaining args
 set "SCRIPT=%ARG1%"
 

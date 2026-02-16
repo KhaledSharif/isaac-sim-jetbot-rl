@@ -10,7 +10,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
-- **RL Training Pipeline**: PPO with BC warmstart, VecNormalize pre-warming, and critic pretraining
+- **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with RLPD-style demo replay
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
 - **LiDAR Sensing**: 24-ray analytical raycasting (180 FOV) for obstacle detection
 
@@ -98,7 +98,8 @@ isaac-sim-jetbot-keyboard/
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
-│   ├── eval_policy.py                # Policy evaluation
+│   ├── train_sac.py                  # SAC/TQC + RLPD training script
+│   ├── eval_policy.py                # Policy evaluation (auto-detects TQC/SAC/PPO)
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py
@@ -155,20 +156,30 @@ isaac-sim-jetbot-keyboard/
 ### Training
 
 ```bash
-# Train PPO agent from scratch (headless for speed)
-./run.sh train_rl.py --headless --timesteps 500000
+# SAC/TQC + RLPD (recommended — demos in replay buffer, no pretraining needed)
+./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000
 
-# Train with BC warmstart from demonstrations (recommended)
+# SAC/TQC with UTD=5 for faster training (~10 steps/s vs ~3 at UTD=20)
+./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000 --utd-ratio 5
+
+# SAC/TQC with obstacles and arena config
+./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000 \
+  --num-obstacles 50 --arena-size 8 --max-steps 1000 --utd-ratio 5
+
+# PPO with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
-
-# Train with GUI to watch the agent
-./run.sh train_rl.py --bc-warmstart demos/recording.npz --timesteps 1000000
 
 # Train BC model only
 ./run.sh train_bc.py demos/recording.npz --epochs 100
 ```
 
-#### BC Warmstart Pipeline
+#### SAC/TQC + RLPD Pipeline (Recommended)
+
+The `train_sac.py` script uses TQC (Truncated Quantile Critics) with RLPD-style 50/50 demo/online replay buffer sampling. No pretraining phases needed — demos are sampled continuously during training. LayerNorm in critics replaces VecNormalize.
+
+Key parameter: `--utd-ratio` controls gradient steps per env step (default 20). Higher UTD = better sample efficiency but slower wall-clock time. See [Training Performance](#training-performance) below.
+
+#### PPO + BC Warmstart Pipeline
 
 When `--bc-warmstart` is provided, the training script runs:
 
@@ -266,6 +277,25 @@ Monitor training progress:
 tensorboard --logdir runs/
 ```
 
+## Training Performance
+
+The dominant cost in SAC/TQC training is **gradient computation**, not physics simulation. Each env step takes ~25ms (`world.step()`), but TQC's 5 critic networks + actor require significant GPU time per gradient update.
+
+| UTD Ratio | Steps/s | 1M Steps Wall Time | Sample Efficiency |
+|-----------|---------|---------------------|-------------------|
+| 20 (default) | ~3 | ~4 days | Best |
+| 5 | ~10-12 | ~24 hours | Good |
+| 1 | ~39 | ~7 hours | Lower |
+
+*Measured on RTX 3090 Ti, 50 obstacles, headless, batch size 256.*
+
+**Recommendation:** `--utd-ratio 5` gives a good balance of speed and sample efficiency. Use `--utd-ratio 20` only if you can afford multi-day runs.
+
+Additional optimizations applied in headless mode:
+- Obstacles use `Visual*` primitives (no PhysX collision — LiDAR is analytical)
+- Viewport updates disabled, rendering decoupled from physics
+- Reduced PhysX solver iterations for single-robot scene
+
 ## Architecture
 
 ### Main Components
@@ -280,7 +310,7 @@ tensorboard --logdir runs/
 
 ### Obstacle System
 
-The SceneManager randomly spawns static obstacles (FixedCuboid, FixedCylinder, FixedSphere, FixedCapsule) with:
+The SceneManager randomly spawns visual-only obstacles (VisualCuboid, VisualCylinder, VisualSphere, VisualCapsule) with:
 - **Configurable count**: Set via `--num-obstacles` parameter (default: 5)
 - **Random shapes**: Mix of boxes, cylinders, spheres, and capsules
 - **Random sizes**: Varied dimensions for each obstacle type

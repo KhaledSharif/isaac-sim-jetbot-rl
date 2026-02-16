@@ -234,7 +234,7 @@ def inject_layernorm_into_critics(model):
 
 
 class VerboseEpisodeCallback:
-    """Prints episode stats at each episode boundary during training."""
+    """Prints episode stats and periodic step-rate info during training."""
 
     @staticmethod
     def create(base_callback_cls):
@@ -248,11 +248,39 @@ class VerboseEpisodeCallback:
                 self._total_successes = 0
                 self._total_collisions = 0
                 self._total_truncations = 0
+                self._start_time = None
+                self._last_report_step = 0
+                self._report_interval = 100  # print step rate every N steps
+
+            def _on_training_start(self):
+                import time, sys
+                self._start_time = time.time()
+                print(f"[DEBUG] Training loop started at step {self.num_timesteps}", flush=True)
 
             def _on_step(self):
+                import time
+
+                total_steps = self.num_timesteps
                 infos = self.locals.get('infos', [{}])
                 rewards = self.locals.get('rewards', [0.0])
                 dones = self.locals.get('dones', [False])
+
+                # First step announcement
+                if total_steps == 1:
+                    print(f"[DEBUG] First env step completed", flush=True)
+
+                # Periodic step-rate report
+                if total_steps - self._last_report_step >= self._report_interval:
+                    elapsed = time.time() - self._start_time if self._start_time else 0
+                    rate = total_steps / elapsed if elapsed > 0 else 0
+                    print(
+                        f"[DEBUG] step={total_steps:>7d} | "
+                        f"elapsed={elapsed:.1f}s | "
+                        f"rate={rate:.1f} steps/s | "
+                        f"episodes={self._ep_count}",
+                        flush=True
+                    )
+                    self._last_report_step = total_steps
 
                 for i in range(len(dones)):
                     info = infos[i] if i < len(infos) else {}
@@ -281,6 +309,7 @@ class VerboseEpisodeCallback:
                             outcome = "TRUNCATED"
 
                         sr = self._total_successes / self._ep_count * 100
+                        elapsed = time.time() - self._start_time if self._start_time else 0
 
                         print(
                             f"[EP {self._ep_count:4d} END]  "
@@ -289,7 +318,9 @@ class VerboseEpisodeCallback:
                             f"return={self._ep_reward:+7.2f} | "
                             f"min_lidar={self._ep_min_lidar:.3f}m | "
                             f"running SR={sr:.1f}% "
-                            f"({self._total_successes}S/{self._total_collisions}C/{self._total_truncations}T)"
+                            f"({self._total_successes}S/{self._total_collisions}C/{self._total_truncations}T) | "
+                            f"t={elapsed:.0f}s",
+                            flush=True
                         )
 
                         new_obs = self.locals.get('new_obs')
@@ -302,7 +333,8 @@ class VerboseEpisodeCallback:
                                 f"[EP {self._ep_count + 1:4d} START] "
                                 f"goal=({goal_x:+.2f}, {goal_y:+.2f}) | "
                                 f"dist={dist:.2f}m | "
-                                f"heading={heading_deg:+.1f}deg"
+                                f"heading={heading_deg:+.1f}deg",
+                                flush=True
                             )
 
                         self._ep_reward = 0.0
@@ -378,7 +410,7 @@ Examples:
                         help='Save checkpoint every N steps (default: 50000)')
 
     # Logging arguments
-    parser.add_argument('--verbose', action='store_true',
+    parser.add_argument('--more-debug', action='store_true',
                         help='Print per-episode stats')
 
     # Output arguments
@@ -439,7 +471,9 @@ Examples:
     print(f"Using algorithm: {algo_name}")
 
     # Create environment (NO VecNormalize)
+    import time as _time
     print("\nCreating environment...")
+    _t0 = _time.time()
     half = args.arena_size / 2.0
     workspace_bounds = {'x': [-half, half], 'y': [-half, half]}
     raw_env = JetbotNavigationEnv(
@@ -450,6 +484,7 @@ Examples:
         max_episode_steps=args.max_steps,
         min_goal_dist=args.min_goal,
     )
+    print(f"  Environment created in {_time.time() - _t0:.1f}s")
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space: {raw_env.action_space.shape}")
 
@@ -484,6 +519,7 @@ Examples:
     print()
 
     # Create model
+    _t0 = _time.time()
     print(f"Creating {algo_name} model...")
     model = algo_cls(
         "MlpPolicy",
@@ -512,6 +548,7 @@ Examples:
 
     # Inject LayerNorm into critics
     inject_layernorm_into_critics(model)
+    print(f"  Model created in {_time.time() - _t0:.1f}s")
     print()
 
     # Create callbacks
@@ -526,7 +563,7 @@ Examples:
         verbose=1,
     )
     callbacks = [checkpoint_callback]
-    if args.verbose:
+    if args.more_debug:
         callbacks.append(VerboseEpisodeCallback.create(BaseCallback))
     callback = CallbackList(callbacks)
 

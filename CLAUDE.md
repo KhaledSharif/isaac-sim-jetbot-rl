@@ -32,7 +32,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - TQC (sb3-contrib) with SAC fallback
    - RLPD-style 50/50 demo/online replay buffer sampling
    - LayerNorm in critics (replaces VecNormalize)
-   - UTD ratio 20 (20 gradient steps per env step)
+   - UTD ratio configurable via `--utd-ratio` (default 20, recommended 5 for speed)
    - No pretraining phases — demos sampled continuously
 
 5. **Supporting Scripts**
@@ -207,6 +207,43 @@ The RL training pipeline uses SB3's `VecNormalize` to z-score normalize observat
 - KL divergence spikes → early stopping throttles learning → exploration freezes
 
 **Key rule:** Any function that feeds observations/returns to the policy or critic network must normalize them using VecNormalize's running stats first.
+
+## Training Performance & Bottlenecks
+
+### UTD Ratio is the Dominant Cost (Not Physics)
+
+The primary bottleneck in SAC/TQC training is **gradient computation, not `world.step()`**. With UTD=20 (default), each env step triggers 20 backward passes through TQC's 5 critic networks + actor. Measured on RTX 3090 Ti with 50 obstacles:
+
+| UTD Ratio | Steps/s | Time for 1M steps |
+|-----------|---------|-------------------|
+| 20        | ~2.9    | ~4 days            |
+| 5         | ~10-12  | ~24 hours          |
+| 1         | ~39     | ~7 hours           |
+
+The env step itself (`world.step()`) takes only ~25ms. At UTD=20, the 20 gradient updates add ~330ms on top.
+
+**Recommendation:** Use `--utd-ratio 5` for a good speed/sample-efficiency tradeoff. UTD=20 (RLPD paper default) is only worth it if you can afford multi-day runs.
+
+### Obstacle Types: Visual vs Fixed
+
+Obstacles use `Visual*` primitives (VisualCuboid, VisualCylinder, etc.) instead of `Fixed*`. This removes them from PhysX broadphase collision. The analytical LiDAR (`LidarSensor`) only reads `obstacle_metadata` (2D position + radius), not physics colliders, so Visual obstacles work identically. This provides a small speedup by reducing PhysX overhead.
+
+### Headless SimulationApp Optimizations
+
+In headless mode, `jetbot_rl_env.py` applies several optimizations:
+- `disable_viewport_updates=True` — skips viewport render products
+- `anti_aliasing=0` — disables AA if any rendering leaks through
+- `rendering_dt=1.0` — decouples render scheduling from physics (effectively never renders)
+- `numThreads=0` — single-threaded physics (faster for single-robot scenes)
+- Reduced solver iterations and CPU broadphase (MBP) via `_optimize_physics_scene()`
+
+These collectively save a few ms per step but are minor compared to UTD ratio.
+
+### What Does NOT Help Much
+
+- **`disable_viewport_updates`**: Small effect since `--no-window` already suppresses most rendering
+- **CPU vs GPU physics**: Marginal for single-robot scenes — PhysX auto-selects well
+- **Reducing reset settle steps**: Saves 8 steps per episode (~200ms/reset), negligible over 1M steps
 
 ## Testing
 

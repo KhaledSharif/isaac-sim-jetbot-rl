@@ -416,12 +416,15 @@ class SceneManager:
         self.obstacle_counter = 0
         self.num_obstacles = num_obstacles
         self.min_goal_dist = min_goal_dist
+        self._goal_spawned = False
+        self._obstacles_spawned = False
 
     def spawn_goal_marker(self, position: list = None, color: tuple = (1.0, 0.5, 0.0, 1.0)) -> np.ndarray:
-        """Spawn a visual goal marker in the scene.
+        """Spawn or reposition the visual goal marker in the scene.
 
-        Deletes the previous goal marker before spawning a new one to ensure
-        only one goal marker exists at a time.
+        On first call, creates the VisualCone prim. On subsequent calls,
+        repositions the existing prim via set_world_pose() to avoid the
+        overhead of prim deletion and recreation.
 
         Args:
             position: [x, y, z] position. If None, uses random position.
@@ -430,49 +433,45 @@ class SceneManager:
         Returns:
             The goal position as numpy array
         """
-        # Delete old goal marker if it exists
-        if self.goal_marker is not None:
-            try:
-                # Try to remove from scene
-                self.world.scene.remove_object(self.goal_marker.name)
-            except (AttributeError, Exception):
-                # If removal fails, just continue - the new marker will replace it
-                pass
-            self.goal_marker = None
-
         if position is None:
             position = self._generate_safe_goal_position()
 
         self.goal_position = np.array(position)
-        self.goal_counter += 1
 
-        prim_path = f"/World/GoalMarker_{self.goal_counter:03d}"
+        # Adjust position to place cone base on ground
+        cone_position = self.goal_position.copy()
+        cone_position[2] = 0.15  # Half the height of the cone
 
-        # Try to use real Isaac Sim primitives
-        try:
-            from isaacsim.core.api.objects import VisualCone
-            # Adjust position to place cone base on ground
-            cone_position = self.goal_position.copy()
-            cone_position[2] = 0.15  # Half the height of the cone
+        if not self._goal_spawned:
+            # First call: create the prim
+            self.goal_counter += 1
+            prim_path = f"/World/GoalMarker_{self.goal_counter:03d}"
 
-            self.goal_marker = self.world.scene.add(
-                VisualCone(
-                    prim_path=prim_path,
-                    name=f"goal_marker_{self.goal_counter:03d}",
-                    position=cone_position,
-                    radius=0.15,  # Base radius
-                    height=0.3,   # Cone height
-                    color=np.array(color[:3])
+            try:
+                from isaacsim.core.api.objects import VisualCone
+                self.goal_marker = self.world.scene.add(
+                    VisualCone(
+                        prim_path=prim_path,
+                        name=f"goal_marker_{self.goal_counter:03d}",
+                        position=cone_position,
+                        radius=0.15,  # Base radius
+                        height=0.3,   # Cone height
+                        color=np.array(color[:3])
+                    )
                 )
-            )
-        except ImportError:
-            # Fall back to mock for testing
-            marker_mock = type('GoalMarker', (), {
-                'name': 'goal_marker',
-                'position': self.goal_position,
-                'color': color
-            })()
-            self.goal_marker = self.world.scene.add(marker_mock)
+            except ImportError:
+                # Fall back to mock for testing
+                marker_mock = type('GoalMarker', (), {
+                    'name': 'goal_marker',
+                    'position': self.goal_position,
+                    'color': color,
+                    'set_world_pose': lambda **kwargs: None
+                })()
+                self.goal_marker = self.world.scene.add(marker_mock)
+            self._goal_spawned = True
+        else:
+            # Subsequent calls: just reposition the existing prim
+            self.goal_marker.set_world_pose(position=cone_position)
 
         # Respawn obstacles after goal is set, retrying if layout is unsolvable
         goal_2d = self.goal_position[:2]
@@ -534,13 +533,7 @@ class SceneManager:
         return self.obstacle_metadata
 
     def clear_obstacles(self) -> None:
-        """Clear all obstacles from the scene."""
-        for obstacle in self.obstacles:
-            try:
-                self.world.scene.remove_object(obstacle.name)
-            except (AttributeError, Exception):
-                pass
-        self.obstacles = []
+        """Clear obstacle metadata (prims are kept alive for reuse)."""
         self.obstacle_metadata = []
 
     def _generate_safe_position(self, min_distance_from_goal: float = 0.5,
@@ -588,106 +581,67 @@ class SceneManager:
         return self._random_position()
 
     def spawn_obstacles(self, num_obstacles: int = None) -> None:
-        """Spawn random obstacles in the scene.
+        """Spawn or reposition obstacles in the scene.
+
+        On first call, creates a pool of VisualCylinder prims. On subsequent
+        calls, repositions the existing prims via set_world_pose() to avoid
+        the overhead of prim deletion and recreation.
+
+        All obstacles use VisualCylinder for pool simplicity — the analytical
+        LiDAR reads obstacle_metadata (position + radius), not prim geometry.
 
         Args:
             num_obstacles: Number of obstacles to spawn. If None, uses self.num_obstacles
         """
-        # Clear existing obstacles first
-        self.clear_obstacles()
+        self.obstacle_metadata = []
 
         if num_obstacles is None:
             num_obstacles = self.num_obstacles
 
-        # Color palette for obstacles (grays, browns, blue-grays)
-        colors = [
-            np.array([0.5, 0.5, 0.5]),    # Gray
-            np.array([0.6, 0.4, 0.2]),    # Brown
-            np.array([0.4, 0.5, 0.6]),    # Blue-gray
-            np.array([0.3, 0.3, 0.3]),    # Dark gray
-            np.array([0.7, 0.7, 0.7]),    # Light gray
-        ]
+        if not self._obstacles_spawned:
+            # First call: create the obstacle prim pool (all cylinders)
+            self.obstacles = []
+            try:
+                from isaacsim.core.api.objects import VisualCylinder
 
-        # Try to import Isaac Sim shapes
-        try:
-            from isaacsim.core.api.objects import (
-                FixedCuboid, FixedCylinder, FixedSphere, FixedCapsule
-            )
+                for i in range(num_obstacles):
+                    self.obstacle_counter += 1
+                    prim_path = f"/World/Obstacle_{self.obstacle_counter:03d}"
+                    name = f"obstacle_{self.obstacle_counter:03d}"
 
-            for i in range(num_obstacles):
-                self.obstacle_counter += 1
-                prim_path = f"/World/Obstacle_{self.obstacle_counter:03d}"
-                name = f"obstacle_{self.obstacle_counter:03d}"
-
-                # Generate safe position
-                position = self._generate_safe_position()
-
-                # Randomly select shape and color
-                shape_type = np.random.choice(['cuboid', 'cylinder', 'sphere', 'capsule'])
-                color = colors[np.random.randint(0, len(colors))]
-
-                # Create obstacle based on shape type
-                pos_2d = np.array(position[:2], dtype=np.float32)
-
-                if shape_type == 'cuboid':
-                    size = np.random.uniform(0.15, 0.3)
-                    obstacle = self.world.scene.add(
-                        FixedCuboid(
-                            prim_path=prim_path,
-                            name=name,
-                            position=np.array(position) + np.array([0, 0, size/2]),  # Adjust for base
-                            size=size,
-                            color=color
-                        )
-                    )
-                    effective_radius = size * np.sqrt(2) / 2
-                elif shape_type == 'cylinder':
+                    position = self._generate_safe_position()
                     radius = np.random.uniform(0.08, 0.15)
                     height = np.random.uniform(0.2, 0.5)
+                    color = np.array([0.5, 0.5, 0.5])
+
                     obstacle = self.world.scene.add(
-                        FixedCylinder(
+                        VisualCylinder(
                             prim_path=prim_path,
                             name=name,
-                            position=np.array(position) + np.array([0, 0, height/2]),  # Adjust for base
+                            position=np.array(position) + np.array([0, 0, height / 2]),
                             radius=radius,
                             height=height,
                             color=color
                         )
                     )
-                    effective_radius = radius
-                elif shape_type == 'sphere':
-                    radius = np.random.uniform(0.1, 0.2)
-                    obstacle = self.world.scene.add(
-                        FixedSphere(
-                            prim_path=prim_path,
-                            name=name,
-                            position=np.array(position) + np.array([0, 0, radius]),  # Adjust for base
-                            radius=radius,
-                            color=color
-                        )
-                    )
-                    effective_radius = radius
-                else:  # capsule
-                    radius = np.random.uniform(0.08, 0.12)
-                    height = np.random.uniform(0.2, 0.4)
-                    obstacle = self.world.scene.add(
-                        FixedCapsule(
-                            prim_path=prim_path,
-                            name=name,
-                            position=np.array(position) + np.array([0, 0, height/2 + radius]),  # Adjust for base
-                            radius=radius,
-                            height=height,
-                            color=color
-                        )
-                    )
-                    effective_radius = radius
+                    self.obstacles.append(obstacle)
+                    pos_2d = np.array(position[:2], dtype=np.float32)
+                    self.obstacle_metadata.append((pos_2d, radius))
 
-                self.obstacles.append(obstacle)
-                self.obstacle_metadata.append((pos_2d, effective_radius))
-
-        except ImportError:
-            # Fall back to no obstacles for testing
-            pass
+            except ImportError:
+                pass
+            self._obstacles_spawned = True
+        else:
+            # Subsequent calls: reposition existing prims
+            for obstacle in self.obstacles:
+                position = self._generate_safe_position()
+                radius = np.random.uniform(0.08, 0.15)
+                height = np.random.uniform(0.2, 0.5)
+                obstacle.set_world_pose(
+                    position=np.array(position) + np.array([0, 0, height / 2])
+                )
+                pos_2d = np.array(position[:2], dtype=np.float32)
+                self.obstacle_metadata.append((pos_2d, radius))
 
     def _generate_safe_goal_position(self) -> list:
         """Generate a goal position that is not too close to the robot start.
