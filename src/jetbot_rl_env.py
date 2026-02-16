@@ -101,6 +101,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         headless: bool = False,
         goal_threshold: float = 0.15,
         num_obstacles: int = 5,
+        min_goal_dist: float = 0.5,
     ):
         """Initialize the Jetbot navigation environment.
 
@@ -112,6 +113,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             headless: If True, run simulation without GUI (faster for training)
             goal_threshold: Distance threshold for considering goal reached
             num_obstacles: Number of obstacles to spawn (default: 5)
+            min_goal_dist: Minimum distance from robot start to goal (meters)
         """
         super().__init__()
 
@@ -123,6 +125,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.headless = headless
         self.goal_threshold = goal_threshold
         self.num_obstacles = num_obstacles
+        self.min_goal_dist = min_goal_dist
 
         # Create LiDAR sensor
         self.lidar_sensor = LidarSensor(
@@ -156,7 +159,8 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.scene_manager = SceneManager(
             self.world,
             workspace_bounds=self.workspace_bounds,
-            num_obstacles=self.num_obstacles
+            num_obstacles=self.num_obstacles,
+            min_goal_dist=self.min_goal_dist,
         )
 
         # Spawn initial goal marker

@@ -368,6 +368,10 @@ Examples:
                         help='Force training on CPU instead of GPU')
     parser.add_argument('--max-steps', type=int, default=500,
                         help='Maximum steps per episode (default: 500)')
+    parser.add_argument('--min-goal', type=float, default=0.5,
+                        help='Minimum distance from robot start to goal in meters (default: 0.5)')
+    parser.add_argument('--inflation-radius', type=float, default=0.08,
+                        help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
 
     # Checkpoint arguments
     parser.add_argument('--checkpoint-freq', type=int, default=50000,
@@ -444,6 +448,7 @@ Examples:
         num_obstacles=args.num_obstacles,
         workspace_bounds=workspace_bounds,
         max_episode_steps=args.max_steps,
+        min_goal_dist=args.min_goal,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space: {raw_env.action_space.shape}")
