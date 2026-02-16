@@ -1796,6 +1796,9 @@ class JetbotKeyboardController:
         self.enable_recording = enable_recording
         self.reward_mode = reward_mode
         self.use_lidar = use_lidar
+        self.arena_size = arena_size
+        self.num_obstacles = num_obstacles
+        self.max_steps = max_steps
 
         # Force LiDAR in automatic mode (A* expert needs 34D observations)
         if automatic:
@@ -2245,12 +2248,22 @@ class JetbotKeyboardController:
         # Apply to robot
         self.jetbot.apply_wheel_actions(actions)
 
+    def _env_metadata(self) -> dict:
+        """Return environment metadata to embed in demo NPZ files."""
+        return {
+            'arena_size': self.arena_size,
+            'num_obstacles': self.num_obstacles,
+            'reward_mode': self.reward_mode,
+            'max_steps': self.max_steps,
+        }
+
     def _perform_checkpoint_save(self) -> bool:
         """Perform checkpoint save of recording data."""
         if self.recorder is None or len(self.recorder.observations) == 0:
             return False
 
-        self.recorder.save(self.demo_save_path, finalize_pending=False)
+        self.recorder.save(self.demo_save_path, finalize_pending=False,
+                           metadata=self._env_metadata())
         self.tui.set_last_command(f"Checkpoint: {len(self.recorder.observations)} frames")
         self.checkpoint_flash_frames = self.checkpoint_flash_duration
         return True
@@ -2469,7 +2482,8 @@ class JetbotKeyboardController:
                         self.recorder.mark_episode_success(False)
                         self.recorder.finalize_episode()
 
-                    self.recorder.save(self.demo_save_path)
+                    self.recorder.save(self.demo_save_path,
+                                       metadata=self._env_metadata())
                     print(f"\nAuto-saved {len(self.recorder.observations)} frames to {self.demo_save_path}")
 
             self._restore_terminal_settings()

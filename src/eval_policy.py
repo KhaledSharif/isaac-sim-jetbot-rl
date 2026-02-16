@@ -74,8 +74,14 @@ Examples:
 
     # Import here to allow --help without Isaac Sim
     from jetbot_rl_env import JetbotNavigationEnv
-    from stable_baselines3 import PPO
+    from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    # Try importing TQC from sb3-contrib
+    try:
+        from sb3_contrib import TQC
+    except ImportError:
+        TQC = None
 
     # Create environment
     print("Creating environment...")
@@ -107,10 +113,22 @@ Examples:
         print("  VecNormalize stats: not found (using raw observations)")
     print()
 
-    # Load trained policy
+    # Load trained policy (auto-detect algorithm)
     print(f"Loading policy from {args.policy_path}...")
-    model = PPO.load(args.policy_path, env=vec_env)
-    print("Policy loaded successfully!\n")
+    model = None
+    for algo_cls, name in [(TQC, "TQC"), (SAC, "SAC"), (PPO, "PPO")]:
+        if algo_cls is None:
+            continue
+        try:
+            model = algo_cls.load(args.policy_path, env=vec_env)
+            print(f"Loaded as {name} policy successfully!\n")
+            break
+        except Exception:
+            continue
+    if model is None:
+        print("Error: Could not load policy with any supported algorithm (TQC/SAC/PPO)")
+        vec_env.close()
+        return 1
 
     # Evaluation metrics
     successes = 0

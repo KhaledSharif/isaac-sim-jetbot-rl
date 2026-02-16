@@ -28,8 +28,15 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - Critic pretraining on Monte Carlo returns
    - Pipeline: validate → prewarm VecNormalize → BC warmstart → critic pretrain → PPO
 
-4. **Supporting Scripts**
-   - `eval_policy.py` - Policy evaluation and metrics
+4. **SAC/TQC + RLPD Pipeline** (`src/train_sac.py`)
+   - TQC (sb3-contrib) with SAC fallback
+   - RLPD-style 50/50 demo/online replay buffer sampling
+   - LayerNorm in critics (replaces VecNormalize)
+   - UTD ratio 20 (20 gradient steps per env step)
+   - No pretraining phases — demos sampled continuously
+
+5. **Supporting Scripts**
+   - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO)
    - `train_bc.py` - Behavioral cloning from demonstrations
    - `replay.py` - Demo playback and inspection
 
@@ -134,13 +141,20 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # Note: --automatic now forces --use-lidar automatically
 ./run.sh --enable-recording --automatic --use-lidar
 
-# Training (from scratch)
+# PPO Training (from scratch)
 ./run.sh train_rl.py --headless --timesteps 500000
 
-# Training with BC warmstart (recommended)
+# PPO Training with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
-# Evaluation
+# SAC/TQC + RLPD Training (recommended — demos in replay buffer, no pretraining needed)
+./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
+
+# SAC/TQC with custom UTD ratio and buffer size
+./run.sh train_sac.py --demos demos/recording.npz --headless --utd-ratio 20 --buffer-size 300000
+
+# Evaluation (auto-detects TQC/SAC/PPO)
+./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100
 ./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
 
 # Tests
@@ -156,7 +170,8 @@ isaac-sim-jetbot-keyboard/
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
-│   ├── eval_policy.py                # Policy evaluation
+│   ├── train_sac.py                  # SAC/TQC + RLPD training script
+│   ├── eval_policy.py                # Policy evaluation (auto-detects TQC/SAC/PPO)
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py
