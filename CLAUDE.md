@@ -33,7 +33,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - RLPD-style demo/online replay buffer sampling (configurable via `--demo-ratio`)
    - LayerNorm in critics (replaces VecNormalize)
    - UTD ratio configurable via `--utd-ratio` (default 20, recommended 5 for speed)
-   - No pretraining phases — demos sampled continuously
+   - No VecNormalize/critic pretraining — demos sampled continuously (BC warmstart still runs)
    - `--resume` to continue training from a checkpoint (step counter, weights preserved)
    - Optional `--lidar-mlp-vae` for DreamerV3-style LiDAR latent compression
 
@@ -193,7 +193,12 @@ isaac-sim-jetbot-keyboard/
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py
-│   └── test_jetbot_rl_env.py
+│   ├── test_jetbot_rl_env.py
+│   ├── test_train_rl.py
+│   ├── test_train_sac.py
+│   ├── test_train_bc.py
+│   ├── test_eval_policy.py
+│   └── test_replay.py
 ├── demos/                            # Recorded demonstrations
 ├── models/                           # Trained models
 ├── runs/                             # TensorBoard logs
@@ -244,7 +249,7 @@ The env step itself (`world.step()`) takes only ~25ms. At UTD=20, the 20 gradien
 
 ### Obstacle Types: Visual vs Fixed
 
-Obstacles use `Visual*` primitives (VisualCuboid, VisualCylinder, etc.) instead of `Fixed*`. This removes them from PhysX broadphase collision. The analytical LiDAR (`LidarSensor`) only reads `obstacle_metadata` (2D position + radius), not physics colliders, so Visual obstacles work identically. This provides a small speedup by reducing PhysX overhead.
+Obstacles use `VisualCylinder` primitives instead of `Fixed*`. This removes them from PhysX broadphase collision. The analytical LiDAR (`LidarSensor`) only reads `obstacle_metadata` (2D position + radius), not physics colliders, so Visual obstacles work identically. This provides a small speedup by reducing PhysX overhead.
 
 ### Headless SimulationApp Optimizations
 
@@ -346,6 +351,8 @@ Optional for camera streaming:
 - PyGObject (python3-gi)
 
 Optional for RL:
+- torch (PyTorch — bundled with Isaac Sim)
 - stable-baselines3
+- sb3-contrib (for TQC; falls back to SAC without it)
 - gymnasium
 - tensorboard

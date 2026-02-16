@@ -104,7 +104,12 @@ isaac-sim-jetbot-keyboard/
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py
-│   └── test_jetbot_rl_env.py
+│   ├── test_jetbot_rl_env.py
+│   ├── test_train_rl.py
+│   ├── test_train_sac.py
+│   ├── test_train_bc.py
+│   ├── test_eval_policy.py
+│   └── test_replay.py
 ├── demos/                            # Recorded demonstrations
 ├── models/                           # Trained models
 ├── runs/                             # TensorBoard logs
@@ -183,7 +188,7 @@ isaac-sim-jetbot-keyboard/
 
 #### SAC/TQC + RLPD Pipeline (Recommended)
 
-The `train_sac.py` script uses TQC (Truncated Quantile Critics) with RLPD-style 50/50 demo/online replay buffer sampling. No pretraining phases needed — demos are sampled continuously during training. LayerNorm in critics replaces VecNormalize.
+The `train_sac.py` script uses TQC (Truncated Quantile Critics) with RLPD-style 50/50 demo/online replay buffer sampling. Unlike the PPO pipeline, no VecNormalize pre-warming or critic pretraining is needed — demos are sampled continuously during training. A BC warmstart on the actor is still performed. LayerNorm in critics replaces VecNormalize.
 
 Key parameter: `--utd-ratio` controls gradient steps per env step (default 20). Higher UTD = better sample efficiency but slower wall-clock time. See [Training Performance](#training-performance) below.
 
@@ -337,13 +342,11 @@ Additional optimizations applied in headless mode:
 
 ### Obstacle System
 
-The SceneManager randomly spawns visual-only obstacles (VisualCuboid, VisualCylinder, VisualSphere, VisualCapsule) with:
+The SceneManager randomly spawns visual-only obstacles (VisualCylinder) with:
 - **Configurable count**: Set via `--num-obstacles` parameter (default: 5)
-- **Random shapes**: Mix of boxes, cylinders, spheres, and capsules
-- **Random sizes**: Varied dimensions for each obstacle type
+- **Random sizes**: Varied radius and height for each cylinder
 - **Safe placement**: Maintains minimum distance from goal (0.5m) and robot start (1.0m)
 - **Automatic respawn**: Obstacles regenerate when goal is reset (pressing 'G' or new episode)
-- **Varied colors**: Gray, brown, and blue-gray tones to contrast with orange goal marker
 
 ### Isaac Sim Integration
 
