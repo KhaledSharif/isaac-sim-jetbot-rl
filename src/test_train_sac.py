@@ -188,6 +188,9 @@ class TestInjectLayernorm:
         import torch.nn as nn
         return sum(1 for m in sequential if isinstance(m, nn.Linear))
 
+    def _count_ofn(self, sequential):
+        return sum(1 for m in sequential if type(m).__name__ == 'OutputFeatureNorm')
+
     def test_tqc_injection(self):
         """Verify LayerNorm layers inserted after hidden Linear layers for TQC."""
         import torch
@@ -232,9 +235,12 @@ class TestInjectLayernorm:
         inject_layernorm_into_critics(model)
 
         # Each critic should now have 2 LayerNorm layers (after each hidden Linear)
+        # and 1 OFN layer (before output Linear)
         for i, net in enumerate(model.critic.quantile_critics):
             ln_count = self._count_layernorms(net)
             assert ln_count == 2, f"Critic {i}: expected 2 LayerNorm, got {ln_count}"
+            ofn_count = self._count_ofn(net)
+            assert ofn_count == 1, f"Critic {i}: expected 1 OFN, got {ofn_count}"
 
     def test_sac_injection(self):
         """Verify LayerNorm layers inserted for SAC qf0/qf1 structure."""
@@ -265,6 +271,8 @@ class TestInjectLayernorm:
 
         assert self._count_layernorms(model.critic.qf0) == 2
         assert self._count_layernorms(model.critic.qf1) == 2
+        assert self._count_ofn(model.critic.qf0) == 1
+        assert self._count_ofn(model.critic.qf1) == 1
 
     def test_target_synced(self):
         """Verify critic_target matches critic state_dict after injection."""
@@ -323,6 +331,77 @@ class TestInjectLayernorm:
 
         inject_layernorm_into_critics(model)
 
-        # Last module should NOT be LayerNorm
-        assert not isinstance(list(model.critic.qf0)[-1], nn.LayerNorm)
-        assert not isinstance(list(model.critic.qf1)[-1], nn.LayerNorm)
+        # Last module should be Linear (output), second-to-last should be OFN
+        modules_qf0 = list(model.critic.qf0)
+        modules_qf1 = list(model.critic.qf1)
+        assert isinstance(modules_qf0[-1], nn.Linear), "Last module should be Linear"
+        assert isinstance(modules_qf1[-1], nn.Linear), "Last module should be Linear"
+        assert type(modules_qf0[-2]).__name__ == 'OutputFeatureNorm', "Second-to-last should be OFN"
+        assert type(modules_qf1[-2]).__name__ == 'OutputFeatureNorm', "Second-to-last should be OFN"
+
+    def test_ofn_produces_unit_norm(self):
+        """Verify OFN output has unit L2 norm."""
+        import torch
+        import torch.nn as nn
+
+        class FakeSACCritic(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qf0 = nn.Sequential(
+                    nn.Linear(36, 256), nn.ReLU(),
+                    nn.Linear(256, 1),
+                )
+                self.qf1 = nn.Sequential(
+                    nn.Linear(36, 256), nn.ReLU(),
+                    nn.Linear(256, 1),
+                )
+
+        model = Mock()
+        model.device = torch.device('cpu')
+        model.lr_schedule = Mock(return_value=3e-4)
+        model.critic = FakeSACCritic()
+        model.critic_target = FakeSACCritic()
+
+        inject_layernorm_into_critics(model)
+
+        # Find the OFN module in qf0
+        ofn = None
+        for m in model.critic.qf0:
+            if type(m).__name__ == 'OutputFeatureNorm':
+                ofn = m
+                break
+        assert ofn is not None, "OFN not found"
+
+        # Pass random input and verify unit norm
+        x = torch.randn(8, 256)
+        out = ofn(x)
+        norms = torch.norm(out, dim=-1)
+        torch.testing.assert_close(norms, torch.ones(8), atol=1e-6, rtol=1e-6)
+
+    def test_sac_5_critics_injection(self):
+        """Verify injection works on SAC with 5 qf* networks (dynamic discovery)."""
+        import torch
+        import torch.nn as nn
+
+        class FakeSAC5Critic(nn.Module):
+            def __init__(self):
+                super().__init__()
+                for i in range(5):
+                    setattr(self, f'qf{i}', nn.Sequential(
+                        nn.Linear(36, 256), nn.ReLU(),
+                        nn.Linear(256, 256), nn.ReLU(),
+                        nn.Linear(256, 1),
+                    ))
+
+        model = Mock()
+        model.device = torch.device('cpu')
+        model.lr_schedule = Mock(return_value=3e-4)
+        model.critic = FakeSAC5Critic()
+        model.critic_target = FakeSAC5Critic()
+
+        inject_layernorm_into_critics(model)
+
+        for i in range(5):
+            net = getattr(model.critic, f'qf{i}')
+            assert self._count_layernorms(net) == 2, f"qf{i}: expected 2 LayerNorm"
+            assert self._count_ofn(net) == 1, f"qf{i}: expected 1 OFN"
