@@ -1653,7 +1653,10 @@ class JetbotKeyboardController:
                  use_lidar: bool = False, arena_size: float = 4.0,
                  max_steps: int = 500, draw_lines: bool = False,
                  min_goal_dist: float = 0.5,
-                 inflation_radius: float = 0.08):
+                 inflation_radius: float = 0.08,
+                 noise_linear: float = 0.02,
+                 noise_angular: float = 0.1,
+                 lookahead: float = 0.2):
         """Initialize the Jetbot robot and keyboard controller.
 
         Args:
@@ -1819,6 +1822,9 @@ class JetbotKeyboardController:
             max_angular_vel=self.MAX_ANGULAR_VELOCITY,
             scene_manager=self.scene_manager,
             robot_radius=inflation_radius,
+            noise_linear=noise_linear,
+            noise_angular=noise_angular,
+            lookahead=lookahead,
         ) if automatic else None
         self.auto_episode_count = 0
         self.auto_step_count = 0
@@ -2565,6 +2571,18 @@ def parse_args():
         '--inflation-radius', type=float, default=0.08,
         help='Obstacle inflation radius for A* planner in meters (default: 0.08)'
     )
+    parser.add_argument(
+        '--noise-linear', type=float, default=0.02,
+        help='Gaussian noise std dev for linear velocity in autopilot (default: 0.02)'
+    )
+    parser.add_argument(
+        '--noise-angular', type=float, default=0.1,
+        help='Gaussian noise std dev for angular velocity in autopilot (default: 0.1)'
+    )
+    parser.add_argument(
+        '--lookahead', type=float, default=0.2,
+        help='Pure pursuit lookahead distance in meters (default: 0.2)'
+    )
     args = parser.parse_args()
 
     # Validate --min-goal against --arena-size
@@ -2584,6 +2602,15 @@ def parse_args():
             f"--inflation-radius ({args.inflation_radius:.2f}) must be less than "
             f"half the arena size ({half:.2f}m) for --arena-size {args.arena_size}"
         )
+    for flag in ('noise_linear', 'noise_angular', 'lookahead'):
+        if getattr(args, flag) != parser.get_default(flag) and not args.automatic:
+            parser.error(f"--{flag.replace('_', '-')} requires --automatic")
+    if args.noise_linear < 0:
+        parser.error("--noise-linear must be non-negative")
+    if args.noise_angular < 0:
+        parser.error("--noise-angular must be non-negative")
+    if args.lookahead <= 0:
+        parser.error("--lookahead must be positive")
 
     return args
 
@@ -2607,5 +2634,8 @@ if __name__ == "__main__":
         draw_lines=args.draw_lines,
         min_goal_dist=args.min_goal,
         inflation_radius=args.inflation_radius,
+        noise_linear=args.noise_linear,
+        noise_angular=args.noise_angular,
+        lookahead=args.lookahead,
     )
     controller.run()
