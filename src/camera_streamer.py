@@ -13,13 +13,15 @@ Dependencies:
 
 import logging
 import numpy as np
+import os
 import subprocess
+import tempfile
 from datetime import datetime
 from typing import Optional
 
 # Set up logging to file
 _log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-_log_file = f"/tmp/jetbot_{_log_timestamp}.log"
+_log_file = os.path.join(tempfile.gettempdir(), f"jetbot_{_log_timestamp}.log")
 
 logging.basicConfig(
     level=logging.DEBUG,

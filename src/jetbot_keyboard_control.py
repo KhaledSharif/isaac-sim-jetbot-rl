@@ -38,7 +38,10 @@ import heapq
 import numpy as np
 import threading
 import sys
-import termios
+try:
+    import termios
+except ImportError:
+    termios = None  # Windows — terminal echo control not needed
 from math import ceil, atan2, pi
 from pynput import keyboard
 
@@ -2283,6 +2286,8 @@ class JetbotKeyboardController:
 
     def _disable_terminal_echo(self):
         """Disable terminal echo to prevent key presses from appearing in TUI."""
+        if termios is None:
+            return  # Windows — not needed
         try:
             self.old_terminal_settings = termios.tcgetattr(sys.stdin)
             new_settings = termios.tcgetattr(sys.stdin)
@@ -2293,6 +2298,8 @@ class JetbotKeyboardController:
 
     def _restore_terminal_settings(self):
         """Restore original terminal settings."""
+        if termios is None:
+            return  # Windows — not needed
         try:
             if self.old_terminal_settings is not None:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_terminal_settings)
