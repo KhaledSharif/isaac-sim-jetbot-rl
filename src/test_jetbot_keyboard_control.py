@@ -665,6 +665,64 @@ class TestDemoRecorder:
         assert len(recorder.observations) == 0
         assert not recorder.is_recording
 
+    def test_abandon_episode_discards_steps(self):
+        """abandon_episode should remove in-progress steps without finalizing."""
+        from jetbot_keyboard_control import DemoRecorder
+        recorder = DemoRecorder(obs_dim=10, action_dim=2)
+
+        recorder.start_recording()
+        # Record a completed episode first
+        for _ in range(3):
+            recorder.record_step(np.ones(10), np.ones(2), 1.0, False)
+        recorder.mark_episode_success(True)
+        recorder.finalize_episode()
+
+        # Now record a partial episode and abandon it
+        for _ in range(5):
+            recorder.record_step(np.ones(10) * 2, np.ones(2), 0.5, False)
+        recorder.abandon_episode()
+
+        # Buffers should be back to end of first episode (3 frames)
+        assert len(recorder.observations) == 3
+        assert len(recorder.actions) == 3
+        assert len(recorder.rewards) == 3
+        assert len(recorder.dones) == 3
+        # Finalized episode count unchanged
+        assert len(recorder.episode_starts) == 1
+        # Episode state reset
+        assert recorder.current_episode_return == 0.0
+        assert recorder._pending_success is None
+
+    def test_abandon_episode_with_no_steps(self):
+        """abandon_episode on empty episode should be a no-op."""
+        from jetbot_keyboard_control import DemoRecorder
+        recorder = DemoRecorder(obs_dim=10, action_dim=2)
+        recorder.start_recording()
+        recorder.abandon_episode()
+        assert len(recorder.observations) == 0
+        assert len(recorder.episode_starts) == 0
+
+    def test_abandon_then_record_continues_normally(self):
+        """After abandoning, new steps should be recorded as a fresh episode."""
+        from jetbot_keyboard_control import DemoRecorder
+        recorder = DemoRecorder(obs_dim=10, action_dim=2)
+        recorder.start_recording()
+
+        # Record and abandon
+        for _ in range(4):
+            recorder.record_step(np.ones(10), np.ones(2), 1.0, False)
+        recorder.abandon_episode()
+
+        # Record a new valid episode
+        for _ in range(2):
+            recorder.record_step(np.ones(10) * 3, np.ones(2), 2.0, False)
+        recorder.mark_episode_success(True)
+        recorder.finalize_episode()
+
+        assert len(recorder.episode_starts) == 1
+        assert recorder.episode_lengths[0] == 2
+        assert recorder.episode_success[0] is True
+
 
 # ============================================================================
 # TEST SUITE: SceneManager
@@ -1151,3 +1209,102 @@ class TestAutoMode:
         ctrl.auto_step_count = 0
 
         assert ctrl.auto_episode_count == 1
+
+    def test_skip_unsolvable_does_not_increment_episode_count(self):
+        """_skip_unsolvable_episode must not increment auto_episode_count."""
+        from jetbot_keyboard_control import (
+            DemoRecorder, AutoPilot, SceneManager,
+            JetbotKeyboardController,
+        )
+
+        class FakeController:
+            headless_tui = True
+            auto_step_count = 0
+            auto_episode_count = 0
+            current_obs = np.zeros(10)
+            MAX_CONSECUTIVE_SKIPS = 100
+
+            def __init__(self):
+                self._consecutive_skips = 0
+                self.recorder = DemoRecorder(obs_dim=10, action_dim=2)
+                self.recorder.start_recording()
+                self.auto_pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+                mock_world = Mock()
+                mock_world.scene = Mock()
+                mock_world.scene.add = Mock(side_effect=lambda x: x)
+                self.scene_manager = SceneManager(mock_world)
+                self.scene_manager.goal_position = np.array([1.0, 1.0, 0.0])
+
+            def _reset_recording_episode(self):
+                pass  # no Isaac Sim
+
+            def _build_current_observation(self):
+                return np.zeros(10)
+
+            def _draw_debug_overlays(self):
+                pass
+
+            def _plan_autopilot_path(self):
+                return False  # no Isaac Sim
+
+            # Bind the real method
+            _skip_unsolvable_episode = JetbotKeyboardController._skip_unsolvable_episode
+
+        ctrl = FakeController()
+        # Record some in-progress steps that should be abandoned
+        for _ in range(7):
+            ctrl.recorder.record_step(np.ones(10), np.zeros(2), 0.0, False)
+
+        ctrl._skip_unsolvable_episode()
+
+        assert ctrl.auto_episode_count == 0, "Episode count must not increment on skip"
+        assert ctrl.auto_step_count == 0, "Step count must be reset on skip"
+        assert len(ctrl.recorder.observations) == 0, "In-progress steps must be discarded"
+        assert len(ctrl.recorder.episode_starts) == 0, "No episode should be finalized"
+
+    def test_skip_unsolvable_episode_resets_autopilot(self):
+        """_skip_unsolvable_episode must call auto_pilot.reset()."""
+        from jetbot_keyboard_control import (
+            DemoRecorder, AutoPilot, SceneManager,
+            JetbotKeyboardController,
+        )
+
+        class FakeController:
+            headless_tui = True
+            auto_step_count = 5
+            auto_episode_count = 2
+            current_obs = np.zeros(10)
+            MAX_CONSECUTIVE_SKIPS = 100
+
+            def __init__(self):
+                self._consecutive_skips = 0
+                self.recorder = DemoRecorder(obs_dim=10, action_dim=2)
+                self.recorder.start_recording()
+                self.auto_pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
+                # Simulate fallback state
+                self.auto_pilot._using_fallback = True
+                self.auto_pilot._path = []
+                mock_world = Mock()
+                mock_world.scene = Mock()
+                mock_world.scene.add = Mock(side_effect=lambda x: x)
+                self.scene_manager = SceneManager(mock_world)
+                self.scene_manager.goal_position = np.array([1.0, 1.0, 0.0])
+
+            def _reset_recording_episode(self):
+                pass
+
+            def _build_current_observation(self):
+                return np.zeros(10)
+
+            def _draw_debug_overlays(self):
+                pass
+
+            def _plan_autopilot_path(self):
+                return False  # still no path
+
+            _skip_unsolvable_episode = JetbotKeyboardController._skip_unsolvable_episode
+
+        ctrl = FakeController()
+        ctrl._skip_unsolvable_episode()
+
+        assert not ctrl.auto_pilot._using_fallback, "AutoPilot fallback flag must be cleared after reset"

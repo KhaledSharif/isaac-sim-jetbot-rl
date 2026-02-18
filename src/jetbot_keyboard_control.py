@@ -396,7 +396,7 @@ class SceneManager:
     }
 
     def __init__(self, world, workspace_bounds: dict = None, num_obstacles: int = 5,
-                 min_goal_dist: float = 0.5):
+                 min_goal_dist: float = 0.5, robot_radius: float = 0.08):
         """Initialize the SceneManager.
 
         Args:
@@ -405,6 +405,7 @@ class SceneManager:
                              [min, max] bounds for random position generation
             num_obstacles: Number of obstacles to spawn (default: 5)
             min_goal_dist: Minimum distance from robot start to goal (meters)
+            robot_radius: Robot radius for C-space inflation in path verification
         """
         self.world = world
         self.goal_marker = None
@@ -416,6 +417,7 @@ class SceneManager:
         self.obstacle_counter = 0
         self.num_obstacles = num_obstacles
         self.min_goal_dist = min_goal_dist
+        self.robot_radius = robot_radius
         self._goal_spawned = False
         self._obstacles_spawned = False
 
@@ -480,7 +482,8 @@ class SceneManager:
             self.spawn_obstacles()
             # Verify A* path exists from start to goal
             grid = OccupancyGrid.from_scene(
-                self.obstacle_metadata, self.workspace_bounds
+                self.obstacle_metadata, self.workspace_bounds,
+                robot_radius=self.robot_radius,
             )
             path = astar_search(grid, (0.0, 0.0), (goal_2d[0], goal_2d[1]))
             if path:
@@ -777,6 +780,20 @@ class DemoRecorder:
 
         # Reset for next episode
         self.current_episode_start = len(self.observations)
+        self.current_episode_return = 0.0
+        self._pending_success = None
+
+    def abandon_episode(self) -> None:
+        """Discard in-progress episode data without finalizing.
+
+        Truncates all buffers back to current_episode_start, erasing any
+        steps recorded since the episode began. Used to skip unsolvable
+        scenes without polluting the demo dataset.
+        """
+        self.observations = self.observations[:self.current_episode_start]
+        self.actions = self.actions[:self.current_episode_start]
+        self.rewards = self.rewards[:self.current_episode_start]
+        self.dones = self.dones[:self.current_episode_start]
         self.current_episode_return = 0.0
         self._pending_success = None
 
@@ -1867,7 +1884,7 @@ class JetbotKeyboardController:
         workspace_bounds = {'x': [-half, half], 'y': [-half, half]}
         self.scene_manager = SceneManager(
             self.world, workspace_bounds=workspace_bounds, num_obstacles=num_obstacles,
-            min_goal_dist=min_goal_dist,
+            min_goal_dist=min_goal_dist, robot_radius=inflation_radius,
         )
 
         # Initialize recording components if enabled
@@ -1897,6 +1914,7 @@ class JetbotKeyboardController:
         self.auto_episode_count = 0
         self.auto_step_count = 0
         self.auto_max_episode_steps = max_steps
+        self._consecutive_skips = 0
 
         # Force-enable recording when automatic mode is set
         if self.automatic and not self.enable_recording:
@@ -2109,6 +2127,7 @@ class JetbotKeyboardController:
         # Update counters
         self.auto_episode_count += 1
         self.auto_step_count = 0
+        self._consecutive_skips = 0
 
         # Reset scene for next episode
         self._reset_recording_episode()
@@ -2133,15 +2152,60 @@ class JetbotKeyboardController:
             self.tui.set_last_command(msg)
 
     def _plan_autopilot_path(self):
-        """Plan A* path for autopilot. Respawn goal up to 10 times if unreachable."""
+        """Plan A* path for autopilot. Respawn goal up to 10 times if unreachable.
+
+        Returns:
+            True if a path was found, False if all attempts failed.
+        """
         if self.auto_pilot is None:
-            return
+            return False
         position, _ = self._get_robot_pose()
         for _ in range(10):
             if self.auto_pilot.plan_path(position[:2]):
-                return
+                return True
             self.scene_manager.reset_goal()
+            # reset_goal() re-randomizes obstacles — invalidate cached grid
+            self.auto_pilot._cached_occ_grid = None
             self.current_obs = self._build_current_observation()
+        return False
+
+    MAX_CONSECUTIVE_SKIPS = 100
+
+    def _skip_unsolvable_episode(self):
+        """Abandon current episode and replan without counting toward episode total.
+
+        Called when A* enters fallback mode (no collision-free path exists).
+        Discards any steps already recorded this episode, resets the scene,
+        and attempts to find a solvable goal configuration.
+
+        If MAX_CONSECUTIVE_SKIPS is exceeded (obstacle layout is permanently
+        blocking the start position), sets should_exit to abort the run.
+        """
+        self._consecutive_skips += 1
+        if self.recorder is not None:
+            self.recorder.abandon_episode()
+        self.auto_step_count = 0
+        self._reset_recording_episode()
+        if self.auto_pilot is not None:
+            self.auto_pilot.reset()
+            self._plan_autopilot_path()
+            self._draw_debug_overlays()
+        self.current_obs = self._build_current_observation()
+
+        if self._consecutive_skips >= self.MAX_CONSECUTIVE_SKIPS:
+            msg = (f"Aborting: {self._consecutive_skips} consecutive unsolvable scenes. "
+                   f"Obstacle layout may be too dense for --inflation-radius.")
+            if self.headless_tui:
+                print(msg)
+            else:
+                self.tui.set_last_command(msg)
+            self.should_exit = True
+        else:
+            msg = f"Skipped unsolvable scene (no A* path) [{self._consecutive_skips}]"
+            if self.headless_tui:
+                print(msg)
+            else:
+                self.tui.set_last_command(msg)
 
     def _draw_debug_overlays(self):
         """Draw debug overlays in the Isaac Sim viewport (obstacle keep-out zones and A* path)."""
@@ -2470,13 +2534,18 @@ class JetbotKeyboardController:
                             last_key_processed = last_char_cmd
 
                         # Autopilot velocity computation
+                        _skip_step = False
                         if self.automatic and self.auto_pilot is not None and self.current_obs is not None:
                             linear_vel, angular_vel = self.auto_pilot.compute_action(self.current_obs)
                             self.current_linear_vel = linear_vel
                             self.current_angular_vel = angular_vel
 
-                            # Draw cyan fallback line when A* fails mid-episode
-                            if self.auto_pilot._fallback_triggered and self._debug_draw is not None:
+                            if self.auto_pilot._using_fallback:
+                                # No A* path — skip this episode instead of driving blind
+                                self._skip_unsolvable_episode()
+                                _skip_step = True
+                            elif self.auto_pilot._fallback_triggered and self._debug_draw is not None:
+                                # Draw cyan fallback line when A* fails mid-episode
                                 origin = self.auto_pilot._fallback_origin
                                 goal = self.scene_manager.get_goal_position()
                                 z = 0.02
@@ -2492,7 +2561,7 @@ class JetbotKeyboardController:
                             self.camera_streamer.capture_and_stream()
 
                         # Record step if recording is active
-                        if self.enable_recording and self.action_mapper is not None:
+                        if not _skip_step and self.enable_recording and self.action_mapper is not None:
                             action = np.array([self.current_linear_vel, self.current_angular_vel], dtype=np.float32)
                             # Normalize action for recording
                             normalized_action = np.array([
@@ -2502,7 +2571,7 @@ class JetbotKeyboardController:
                             self._record_step(normalized_action)
 
                         # Automatic episode management
-                        if self.automatic:
+                        if not _skip_step and self.automatic:
                             self.auto_step_count += 1
                             position, _ = self._get_robot_pose()
                             goal_reached = self.scene_manager.check_goal_reached(position)
