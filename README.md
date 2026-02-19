@@ -10,10 +10,13 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
-- **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with RLPD-style demo replay
-- **LiDAR MLP-VAE**: Optional DreamerV3-style VAE for compressed LiDAR latent representations
+- **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with Chunk CVAE + Q-Chunking
+- **Action Chunking**: k-step action chunks reduce compounding errors from single-step BC
+- **Chunk CVAE**: Conditional VAE pretraining handles multimodal demonstrations
+- **Q-Chunking**: Critic evaluates chunk-level Q-values via `ChunkedEnvWrapper`
 - **Gymnasium Integration**: Standard RL environment compatible with Stable-Baselines3
 - **LiDAR Sensing**: 24-ray analytical raycasting (180 FOV) for obstacle detection
+- **Solvability Checks**: A* path verification on reset ensures navigable goal placements
 
 ## Requirements
 
@@ -62,10 +65,10 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 ./run.sh --num-obstacles 10
 ```
 
-### Train RL Agent
+### Train RL Agent (SAC/TQC + Chunk CVAE)
 
 ```bash
-./run.sh train_rl.py --headless --timesteps 500000
+./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
 ```
 
 ## Controls
@@ -164,22 +167,23 @@ isaac-sim-jetbot-keyboard/
 ### Training
 
 ```bash
-# SAC/TQC + RLPD (recommended — demos in replay buffer, no pretraining needed)
+# SAC/TQC + Chunk CVAE + Q-Chunking (recommended)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000
 
-# SAC/TQC with UTD=5 for faster training (~10 steps/s vs ~3 at UTD=20)
-./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000 --utd-ratio 5
+# Custom chunk size and UTD ratio
+./run.sh train_sac.py --demos demos/recording.npz --headless --chunk-size 5 --utd-ratio 5
 
 # SAC/TQC with obstacles and arena config
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000 \
   --num-obstacles 50 --arena-size 8 --max-steps 1000 --utd-ratio 5
 
-# SAC/TQC with LiDAR MLP-VAE (DreamerV3-style latent compression)
-./run.sh train_sac.py --demos demos/recording.npz --headless --lidar-mlp-vae
+# Custom CVAE hyperparameters
+./run.sh train_sac.py --demos demos/recording.npz --headless \
+  --cvae-epochs 200 --cvae-beta 0.05 --cvae-z-dim 16
 
-# LiDAR MLP-VAE with custom VAE hyperparameters
-./run.sh train_sac.py --demos demos/recording.npz --headless --lidar-mlp-vae \
-  --vae-epochs 200 --vae-beta 0.05 --vae-aux-freq 5 --vae-aux-lr 1e-4
+# Resume training from checkpoint
+./run.sh train_sac.py --demos demos/recording.npz --headless \
+  --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
 
 # PPO with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
@@ -188,30 +192,41 @@ isaac-sim-jetbot-keyboard/
 ./run.sh train_bc.py demos/recording.npz --epochs 100
 ```
 
-#### SAC/TQC + RLPD Pipeline (Recommended)
+#### SAC/TQC + Chunk CVAE + Q-Chunking Pipeline (Recommended)
 
-The `train_sac.py` script uses TQC (Truncated Quantile Critics) with RLPD-style 50/50 demo/online replay buffer sampling. Unlike the PPO pipeline, no VecNormalize pre-warming or critic pretraining is needed — demos are sampled continuously during training. A BC warmstart on the actor is still performed. LayerNorm in critics replaces VecNormalize.
+The `train_sac.py` script uses TQC (Truncated Quantile Critics) with action chunking and RLPD-style 50/50 demo/online replay buffer sampling. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking). LayerNorm in critics replaces VecNormalize.
 
-Key parameter: `--utd-ratio` controls gradient steps per env step (default 20). Higher UTD = better sample efficiency but slower wall-clock time. See [Training Performance](#training-performance) below.
-
-#### LiDAR MLP-VAE (Optional)
-
-When `--lidar-mlp-vae` is enabled, a DreamerV3-style MLP-VAE preprocesses LiDAR observations into a compressed 16D latent space before feeding into the actor/critic networks:
-
+**Architecture:**
 ```
-34D obs -> split -> [state 0:10]  -> symlog -> MLP(10->64->32)  -> concat -> 48D -> actor/critic
-                    [lidar 10:34] -> symlog -> VAE enc(24->128->64->16D) /
+ChunkedEnvWrapper: action_space (2,) → (k*2,), executes k sub-steps per wrapper step
+  R_chunk = Σ γ^i r_i, effective gamma = γ^k
+
+Actor:  obs(34D) → ChunkCVAEFeatureExtractor → (obs_features || z=0) → latent_pi → mu → tanh → (k*2)
+Critic: Q(obs_features || z=0, action_chunk) → scalar
+
+ChunkCVAEFeatureExtractor:
+  34D obs → split → [state 0:10]  → symlog → MLP(10→64→32)  →  32D ┐
+                     [lidar 10:34] → symlog → MLP(24→128→64)  →  64D ├→ concat → 96D + z_pad(8D) = 104D
 ```
 
-The pipeline: pretrain VAE on demo LiDAR data, inject pretrained weights into the SB3 model, BC warmstart with feature extractor, then train with an auxiliary VAE reconstruction+KL loss. TensorBoard logs `vae/recon_loss`, `vae/kl_loss`, and `vae/total_loss`.
+**Pipeline order:**
+1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
+2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
+3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-2.0
+4. Inject LayerNorm into critics
+5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
+6. Copy pretrained feature extractor weights → critic/critic_target
+7. Train with SAC/TQC (CVAE encoder discarded, z-slot zeroed during RL)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--lidar-mlp-vae` | off | Enable VAE feature extractor |
-| `--vae-epochs` | 100 | VAE pretraining epochs |
-| `--vae-beta` | 0.1 | KL divergence weight |
-| `--vae-aux-freq` | 10 | Auxiliary loss frequency (steps) |
-| `--vae-aux-lr` | 1e-4 | Auxiliary loss learning rate |
+| `--chunk-size` | 10 | Action chunk size (k) |
+| `--cvae-z-dim` | 8 | CVAE latent dimension |
+| `--cvae-epochs` | 100 | CVAE pretraining epochs |
+| `--cvae-beta` | 0.1 | CVAE KL weight |
+| `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
+| `--utd-ratio` | 20 | Gradient steps per env step |
+| `--demo-ratio` | 0.5 | Fraction of batch from demos |
 
 #### PPO + BC Warmstart Pipeline
 
@@ -228,11 +243,14 @@ The VecNormalize pre-warming step is critical: without it, the BC-learned policy
 ### Evaluation
 
 ```bash
-# Evaluate trained policy
-./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
+# Evaluate trained policy (auto-detects TQC/SAC/PPO and chunk size)
+./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100
 
 # Headless evaluation
-./run.sh eval_policy.py models/ppo_jetbot.zip --headless --episodes 100
+./run.sh eval_policy.py models/tqc_jetbot.zip --headless --episodes 100
+
+# Override chunk size or inflation radius
+./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
 ```
 
 ### Demo Inspection
@@ -335,7 +353,9 @@ Additional optimizations applied in headless mode:
 ### Main Components
 
 - **JetbotKeyboardController**: Main application with keyboard input and Rich TUI
-- **JetbotNavigationEnv**: Gymnasium-compatible RL environment
+- **JetbotNavigationEnv**: Gymnasium-compatible RL environment with A* solvability checks on reset
+- **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking
+- **ChunkCVAEFeatureExtractor**: Split state/lidar MLPs + z-pad slot for CVAE latent variable
 - **DifferentialController**: Converts velocity commands to wheel speeds
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations

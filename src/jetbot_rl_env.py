@@ -34,8 +34,10 @@ from gymnasium import spaces
 from jetbot_keyboard_control import (
     LidarSensor,
     ObservationBuilder,
+    OccupancyGrid,
     RewardComputer,
     SceneManager,
+    astar_search,
 )
 from jetbot_config import (
     WHEEL_RADIUS, WHEEL_BASE,
@@ -100,6 +102,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         goal_threshold: float = 0.15,
         num_obstacles: int = 5,
         min_goal_dist: float = 0.5,
+        inflation_radius: float = 0.08,
     ):
         """Initialize the Jetbot navigation environment.
 
@@ -112,6 +115,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             goal_threshold: Distance threshold for considering goal reached
             num_obstacles: Number of obstacles to spawn (default: 5)
             min_goal_dist: Minimum distance from robot start to goal (meters)
+            inflation_radius: Obstacle inflation radius for A* solvability checks (meters)
         """
         super().__init__()
 
@@ -124,6 +128,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.goal_threshold = goal_threshold
         self.num_obstacles = num_obstacles
         self.min_goal_dist = min_goal_dist
+        self.inflation_radius = inflation_radius
 
         # Create LiDAR sensor
         self.lidar_sensor = LidarSensor(
@@ -159,6 +164,7 @@ class JetbotNavigationEnv(gymnasium.Env):
             workspace_bounds=self.workspace_bounds,
             num_obstacles=self.num_obstacles,
             min_goal_dist=self.min_goal_dist,
+            robot_radius=self.inflation_radius,
         )
 
         # Spawn initial goal marker
@@ -310,8 +316,22 @@ class JetbotNavigationEnv(gymnasium.Env):
         self._current_linear_vel = 0.0
         self._current_angular_vel = 0.0
 
-        # Reset goal to new random position
-        self.scene_manager.reset_goal()
+        # Solvability loop: retry goal + obstacles until A* finds a path
+        max_solvability_attempts = 20
+        robot_xy = tuple(self.START_POSITION[:2])
+        for attempt in range(max_solvability_attempts):
+            self.scene_manager.reset_goal()
+            grid = OccupancyGrid.from_scene(
+                self.scene_manager.get_obstacle_metadata(),
+                self.workspace_bounds,
+                robot_radius=self.inflation_radius,
+            )
+            goal_pos = self.scene_manager.get_goal_position()
+            path = astar_search(grid, robot_xy, tuple(goal_pos[:2]))
+            if path:
+                break
+        else:
+            print(f"Warning: no solvable layout found after {max_solvability_attempts} attempts, using last layout")
 
         # Step simulation to settle physics
         for _ in range(2):
@@ -485,3 +505,52 @@ class JetbotNavigationEnv(gymnasium.Env):
         """Clean up resources."""
         if self.simulation_app is not None:
             self.simulation_app.close()
+
+
+class ChunkedEnvWrapper(gymnasium.Wrapper):
+    """Wrapper that converts single-step actions to k-step action chunks.
+
+    The wrapper expands the action space from (2,) to (k*2,) and executes
+    k inner env steps per wrapper step. Rewards are accumulated as a
+    discounted sum: R_chunk = sum(gamma^i * r_i for i in range(k)).
+
+    This enables Q-chunking: the critic evaluates chunk-level Q-values,
+    and the Bellman target uses gamma^k as the effective discount.
+    """
+
+    def __init__(self, env, chunk_size, gamma=0.99):
+        super().__init__(env)
+        self.chunk_size = chunk_size
+        self.gamma = gamma
+
+        # Expand action space: (2,) → (k*2,)
+        low = np.tile(env.action_space.low, chunk_size)
+        high = np.tile(env.action_space.high, chunk_size)
+        self.action_space = spaces.Box(
+            low=low, high=high, dtype=env.action_space.dtype
+        )
+
+    def step(self, action_flat):
+        """Execute k inner steps with the action chunk.
+
+        Args:
+            action_flat: flat action array of shape (k*2,)
+
+        Returns:
+            (obs, R_chunk, terminated, truncated, info) after k inner steps
+        """
+        actions = action_flat.reshape(self.chunk_size, -1)
+
+        r_chunk = 0.0
+        terminated = False
+        truncated = False
+        obs = None
+        info = {}
+
+        for i, act in enumerate(actions):
+            obs, reward, terminated, truncated, info = self.env.step(act)
+            r_chunk += (self.gamma ** i) * reward
+            if terminated or truncated:
+                break
+
+        return obs, r_chunk, terminated, truncated, info

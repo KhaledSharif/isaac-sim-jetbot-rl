@@ -24,110 +24,177 @@ def symlog(x):
     return torch.sign(x) * torch.log1p(torch.abs(x))
 
 
-class LidarMLPVAE:
-    """MLP-based VAE for LiDAR observation compression.
+class ChunkCVAEFeatureExtractor:
+    """SB3 feature extractor for Chunk CVAE with split state/lidar MLPs.
 
-    Encoder: 24D → 128 → 64 → (μ, logvar) each 16D
-    Decoder: 16D → 64 → 128 → 24D
+    Splits 34D obs into state (0:10) and LiDAR (10:34), applies symlog,
+    processes through separate MLPs, and concatenates with a zero-padded
+    z-slot for the CVAE latent variable.
+
+    Output: concat(state_features, lidar_features, z_pad) = 96 + z_dim
     """
 
+    _cls = None
+
     @staticmethod
-    def create(input_dim=24, hidden_dim=128, latent_dim=16):
+    def create(base_extractor_cls, z_dim=8):
         import torch
         import torch.nn as nn
 
-        class _LidarMLPVAE(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.input_dim = input_dim
-                self.latent_dim = latent_dim
+        class _ChunkCVAEFeatureExtractor(base_extractor_cls):
+            def __init__(self, observation_space, features_dim=104):
+                super().__init__(observation_space, features_dim=features_dim)
+                self._z_dim = z_dim
+                self._obs_feature_dim = features_dim - z_dim
 
-                # Encoder
-                self.encoder = nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
+                self.state_mlp = nn.Sequential(
+                    nn.Linear(10, 64),
                     nn.SiLU(),
-                    nn.Linear(hidden_dim, 64),
+                    nn.Linear(64, 32),
                     nn.SiLU(),
                 )
-                self.mu_head = nn.Linear(64, latent_dim)
-                self.logvar_head = nn.Linear(64, latent_dim)
 
-                # Decoder
-                self.decoder = nn.Sequential(
-                    nn.Linear(latent_dim, 64),
+                self.lidar_mlp = nn.Sequential(
+                    nn.Linear(24, 128),
                     nn.SiLU(),
-                    nn.Linear(64, hidden_dim),
+                    nn.Linear(128, 64),
                     nn.SiLU(),
-                    nn.Linear(hidden_dim, input_dim),
                 )
 
-            def encode(self, x):
-                h = self.encoder(x)
-                return self.mu_head(h), self.logvar_head(h)
+            def encode_obs(self, observations):
+                """Encode observations into obs_features (without z padding).
 
-            def reparameterize(self, mu, logvar):
-                if self.training:
-                    std = torch.exp(0.5 * logvar)
-                    eps = torch.randn_like(std)
-                    return mu + eps * std
-                return mu
+                Returns:
+                    obs_features tensor of shape (batch, 96)
+                """
+                state = symlog(observations[:, :10])
+                lidar = symlog(observations[:, 10:34])
+                state_features = self.state_mlp(state)
+                lidar_features = self.lidar_mlp(lidar)
+                return torch.cat([state_features, lidar_features], dim=-1)
 
-            def decode(self, z):
-                return self.decoder(z)
+            def forward(self, observations):
+                obs_features = self.encode_obs(observations)
+                z_pad = torch.zeros(
+                    obs_features.shape[0], self._z_dim,
+                    device=obs_features.device, dtype=obs_features.dtype,
+                )
+                return torch.cat([obs_features, z_pad], dim=-1)
 
-            def forward(self, x):
-                mu, logvar = self.encode(x)
-                z = self.reparameterize(mu, logvar)
-                recon = self.decode(z)
-                return z, mu, logvar, recon
+        return _ChunkCVAEFeatureExtractor
 
-        return _LidarMLPVAE()
+    @classmethod
+    def get_class(cls, base_extractor_cls, z_dim=8):
+        # Always recreate to capture z_dim closure
+        cls._cls = cls.create(base_extractor_cls, z_dim=z_dim)
+        return cls._cls
 
 
-def pretrain_lidar_vae(demo_obs, vae=None, epochs=100, lr=1e-3, beta=0.1, batch_size=256):
-    """Pretrain LiDAR VAE on demo observations.
+def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
+                        chunk_size, z_dim=8, epochs=100, batch_size=256,
+                        lr=1e-3, beta=0.1, gamma=0.99):
+    """Pretrain actor via Chunk CVAE: encoder maps (obs, action_chunk) → z,
+    decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk.
+
+    After pretraining the encoder is discarded. The z-slot is zeroed during RL.
 
     Args:
-        demo_obs: numpy array of demo observations (N, 34)
-        vae: Optional pre-built LidarMLPVAE; creates one if None
-        epochs: Number of pretraining epochs
-        lr: Learning rate
-        beta: KL divergence weight
-        batch_size: Mini-batch size
-
-    Returns:
-        Trained LidarMLPVAE in eval mode
+        model: SB3 SAC/TQC model (actor must use ChunkCVAEFeatureExtractor)
+        demo_obs: numpy (N, 34) step-level observations
+        demo_actions: numpy (N, 2) step-level actions
+        episode_lengths: numpy array of per-episode step counts
+        chunk_size: action chunk size (k)
+        z_dim: CVAE latent dimension
+        epochs: pretraining epochs
+        batch_size: mini-batch size
+        lr: learning rate
+        beta: KL weight
+        gamma: discount factor (unused here, kept for API consistency)
     """
     import torch
+    import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
+    from demo_utils import extract_action_chunks
 
     print("\n" + "=" * 60)
-    print("LiDAR VAE Pretraining")
+    print("Chunk CVAE Pretraining")
     print("=" * 60)
 
-    # Extract LiDAR channels and apply symlog
-    lidar_np = demo_obs[:, 10:34].astype(np.float32)
-    lidar_tensor = symlog(torch.tensor(lidar_np))
+    # Extract action chunks from demo data
+    chunk_obs, chunk_actions_flat = extract_action_chunks(
+        demo_obs, demo_actions, episode_lengths, chunk_size)
+    action_chunk_dim = chunk_size * demo_actions.shape[1]
 
-    dataset = TensorDataset(lidar_tensor)
+    print(f"  Chunk size: {chunk_size}, z_dim: {z_dim}")
+    print(f"  {len(chunk_obs)} chunks from {len(episode_lengths)} episodes")
+
+    device = model.device
+    dataset = TensorDataset(
+        torch.tensor(chunk_obs, dtype=torch.float32),
+        torch.tensor(chunk_actions_flat, dtype=torch.float32),
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    if vae is None:
-        vae = LidarMLPVAE.create()
-    vae.train()
+    # Get obs feature dim from the feature extractor
+    obs_feature_dim = model.actor.features_extractor._obs_feature_dim
 
-    optimizer = torch.optim.Adam(vae.parameters(), lr=lr)
+    # Temporary CVAE encoder (discarded after pretraining)
+    cvae_encoder = nn.Sequential(
+        nn.Linear(obs_feature_dim + action_chunk_dim, 128),
+        nn.SiLU(),
+        nn.Linear(128, 64),
+        nn.SiLU(),
+    ).to(device)
+    cvae_mu = nn.Linear(64, z_dim).to(device)
+    cvae_logvar = nn.Linear(64, z_dim).to(device)
 
-    print(f"  Training VAE for {epochs} epochs on {len(lidar_np)} LiDAR samples...")
+    # Parameters to optimize: feature_extractor + latent_pi + mu + cvae_encoder
+    params = (
+        list(model.actor.features_extractor.parameters())
+        + list(model.actor.latent_pi.parameters())
+        + list(model.actor.mu.parameters())
+        + list(cvae_encoder.parameters())
+        + list(cvae_mu.parameters())
+        + list(cvae_logvar.parameters())
+    )
+    optimizer = torch.optim.Adam(params, lr=lr)
+
+    print(f"  Training CVAE for {epochs} epochs...")
 
     for epoch in range(epochs):
         total_recon = 0.0
         total_kl = 0.0
         n_batches = 0
-        for (batch,) in loader:
-            z, mu, logvar, recon = vae(batch)
-            recon_loss = torch.nn.functional.mse_loss(recon, batch)
-            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+        for obs_batch, act_batch in loader:
+            obs_batch = obs_batch.to(device)
+            act_batch = act_batch.to(device)
+
+            # Encode observations → obs_features (96D)
+            obs_features = model.actor.features_extractor.encode_obs(obs_batch)
+
+            # CVAE encoder: (obs_features, action_chunk) → z
+            enc_input = torch.cat([obs_features, act_batch], dim=-1)
+            h = cvae_encoder(enc_input)
+            mu_z = cvae_mu(h)
+            logvar_z = cvae_logvar(h)
+
+            # Reparameterize
+            std_z = torch.exp(0.5 * logvar_z)
+            eps = torch.randn_like(std_z)
+            z = mu_z + eps * std_z
+
+            # Replace z-slot in features: concat(obs_features, z)
+            features = torch.cat([obs_features, z], dim=-1)
+
+            # Decode through actor's latent_pi → mu → tanh
+            latent = model.actor.latent_pi(features)
+            mean_actions = model.actor.mu(latent)
+            pred_actions = torch.tanh(mean_actions)
+
+            # Loss: L1 reconstruction + β·KL
+            recon_loss = torch.nn.functional.l1_loss(pred_actions, act_batch)
+            kl_loss = -0.5 * torch.mean(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
             loss = recon_loss + beta * kl_loss
 
             optimizer.zero_grad()
@@ -138,128 +205,24 @@ def pretrain_lidar_vae(demo_obs, vae=None, epochs=100, lr=1e-3, beta=0.1, batch_
             total_kl += kl_loss.item()
             n_batches += 1
 
-        if (epoch + 1) % 20 == 0 or epoch == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1:4d}/{epochs}, "
-                  f"Recon: {total_recon / n_batches:.6f}, "
+                  f"L1: {total_recon / n_batches:.6f}, "
                   f"KL: {total_kl / n_batches:.6f}")
 
-    vae.eval()
-    print("LiDAR VAE pretraining complete!")
+    # Copy pretrained features_extractor weights → critic and critic_target
+    fe_state = model.actor.features_extractor.state_dict()
+    model.critic.features_extractor.load_state_dict(fe_state)
+    model.critic_target.features_extractor.load_state_dict(fe_state)
+    print("  Feature extractor weights copied to critic/critic_target")
+
+    # Tighten log_std to preserve CVAE-learned behavior
+    model.actor.log_std.weight.data.zero_()
+    model.actor.log_std.bias.data.fill_(-2.0)
+    print("  Exploration noise tightened (log_std bias = -2.0, std ~ 0.135)")
+
+    print("Chunk CVAE pretraining complete!")
     print("=" * 60 + "\n")
-    return vae
-
-
-class LidarVAEFeatureExtractor:
-    """SB3 feature extractor that uses a VAE for LiDAR and MLP for state.
-
-    Splits 34D obs into state (0:10) and LiDAR (10:34), applies symlog,
-    processes through separate networks, and concatenates to 48D output.
-    """
-
-    @staticmethod
-    def create(base_extractor_cls):
-        import torch
-        import torch.nn as nn
-
-        class _LidarVAEFeatureExtractor(base_extractor_cls):
-            def __init__(self, observation_space, features_dim=48,
-                         pretrained_vae=None, state_hidden=64, state_out=32):
-                super().__init__(observation_space, features_dim=features_dim)
-
-                self.state_mlp = nn.Sequential(
-                    nn.Linear(10, state_hidden),
-                    nn.SiLU(),
-                    nn.Linear(state_hidden, state_out),
-                    nn.SiLU(),
-                )
-
-                if pretrained_vae is not None:
-                    self.vae = pretrained_vae
-                else:
-                    self.vae = LidarMLPVAE.create()
-
-            def forward(self, observations):
-                state = symlog(observations[:, :10])
-                lidar = symlog(observations[:, 10:34])
-
-                state_features = self.state_mlp(state)
-                mu, _ = self.vae.encode(lidar)
-                lidar_features = self.vae.reparameterize(mu, _)
-
-                return torch.cat([state_features, lidar_features], dim=-1)
-
-        return _LidarVAEFeatureExtractor
-
-    # Store class reference for deserialization
-    _cls = None
-
-    @classmethod
-    def get_class(cls, base_extractor_cls):
-        if cls._cls is None:
-            cls._cls = cls.create(base_extractor_cls)
-        return cls._cls
-
-
-class VAEAuxLossCallback:
-    """Auxiliary VAE reconstruction + KL loss applied during RL training."""
-
-    @staticmethod
-    def create(base_callback_cls, aux_freq=10, beta=0.1, aux_lr=1e-4):
-        import torch
-
-        class _VAEAuxLossCallback(base_callback_cls):
-            def __init__(self):
-                super().__init__(verbose=0)
-                self._aux_freq = aux_freq
-                self._beta = beta
-                self._aux_lr = aux_lr
-                self._optimizer = None
-
-            def _on_training_start(self):
-                # Create optimizer for VAE encoder+decoder in actor's feature extractor
-                vae = self.model.actor.features_extractor.vae
-                self._optimizer = torch.optim.Adam(vae.parameters(), lr=self._aux_lr)
-
-            def _on_step(self):
-                if self.num_timesteps % self._aux_freq != 0:
-                    return True
-
-                # Sample batch from replay buffer
-                replay = self.model.replay_buffer
-                if replay.size() == 0 and not hasattr(replay, 'demo_obs'):
-                    return True
-
-                batch = replay.sample(self.model.batch_size)
-                obs = batch.observations
-
-                # Extract LiDAR and apply symlog
-                lidar = symlog(obs[:, 10:34])
-
-                # Forward through actor's VAE
-                vae = self.model.actor.features_extractor.vae
-                was_training = vae.training
-                vae.train()
-
-                z, mu, logvar, recon = vae(lidar)
-                recon_loss = torch.nn.functional.mse_loss(recon, lidar)
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                total_loss = recon_loss + self._beta * kl_loss
-
-                self._optimizer.zero_grad()
-                total_loss.backward()
-                self._optimizer.step()
-
-                if not was_training:
-                    vae.eval()
-
-                # Log to TensorBoard
-                self.logger.record("vae/recon_loss", recon_loss.item())
-                self.logger.record("vae/kl_loss", kl_loss.item())
-                self.logger.record("vae/total_loss", total_loss.item())
-
-                return True
-
-        return _VAEAuxLossCallback()
 
 
 def make_demo_replay_buffer(buffer_cls, buffer_size, observation_space, action_space,
@@ -393,76 +356,9 @@ def inject_layernorm_into_critics(model):
     print("LayerNorm + OFN injected into critic networks")
 
 
-def bc_warmstart_sac(model, demo_obs, demo_actions, epochs=50, batch_size=256, lr=1e-3,
-                     include_feature_extractor=False):
-    """Pretrain SAC/TQC actor on demo actions via behavioral cloning.
-
-    Only trains latent_pi (hidden layers) and mu (mean output) — leaves log_std
-    untouched so SAC's entropy tuning can adjust exploration post-BC.
-
-    Args:
-        model: SB3 SAC or TQC model
-        demo_obs: numpy array of demo observations
-        demo_actions: numpy array of demo actions (normalized to [-1, 1])
-        epochs: Number of BC epochs
-        batch_size: BC mini-batch size
-        lr: Learning rate for BC optimizer
-        include_feature_extractor: If True, also optimize feature extractor params
-    """
-    import torch
-    from torch.utils.data import DataLoader, TensorDataset
-
-    print("\n" + "=" * 60)
-    print("BC Warmstart (SAC/TQC Actor)")
-    print("=" * 60)
-
-    dataset = TensorDataset(
-        torch.tensor(demo_obs, dtype=torch.float32),
-        torch.tensor(demo_actions, dtype=torch.float32),
-    )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # Only optimize actor mean path (not log_std)
-    actor_params = (
-        list(model.actor.latent_pi.parameters())
-        + list(model.actor.mu.parameters())
-    )
-    if include_feature_extractor:
-        actor_params += list(model.actor.features_extractor.parameters())
-    optimizer = torch.optim.Adam(actor_params, lr=lr)
-    loss_fn = torch.nn.MSELoss()
-    device = model.device
-
-    print(f"  Pretraining actor for {epochs} epochs on {len(dataset)} transitions...")
-
-    for epoch in range(epochs):
-        total_loss = 0.0
-        n_batches = 0
-        for obs_batch, act_batch in loader:
-            obs_batch = obs_batch.to(device)
-            act_batch = act_batch.to(device)
-
-            mean_actions, _, _ = model.actor.get_action_dist_params(obs_batch)
-            pred_actions = torch.tanh(mean_actions)
-            loss = loss_fn(pred_actions, act_batch)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            n_batches += 1
-
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  Epoch {epoch+1:4d}/{epochs}, Loss: {total_loss / n_batches:.6f}")
-
-    print("BC warmstart complete!")
-    print("=" * 60 + "\n")
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description='Train SAC/TQC agent with RLPD-style demo replay for Jetbot navigation',
+        description='Train SAC/TQC agent with Chunk CVAE + Q-chunking for Jetbot navigation',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -471,6 +367,9 @@ Examples:
 
   %(prog)s --demos demos/recording.npz --headless --timesteps 500000
       Train for 500k timesteps
+
+  %(prog)s --demos demos/recording.npz --headless --chunk-size 5
+      Use chunk size 5 instead of default 10
 
   %(prog)s --demos demos/recording.npz --headless --cpu --timesteps 1000
       Quick smoke test on CPU
@@ -503,13 +402,17 @@ Examples:
     parser.add_argument('--demo-ratio', type=float, default=0.5,
                         help='Fraction of each batch sampled from demos, 0.0-1.0 (default: 0.5)')
 
-    # BC warmstart arguments
-    parser.add_argument('--bc-epochs', type=int, default=50,
-                        help='Number of BC pretraining epochs (default: 50)')
-    parser.add_argument('--bc-batch-size', type=int, default=256,
-                        help='BC pretraining batch size (default: 256)')
-    parser.add_argument('--bc-lr', type=float, default=1e-3,
-                        help='BC pretraining learning rate (default: 1e-3)')
+    # Chunk CVAE arguments
+    parser.add_argument('--chunk-size', type=int, default=10,
+                        help='Action chunk size for Q-chunking (default: 10)')
+    parser.add_argument('--cvae-z-dim', type=int, default=8,
+                        help='CVAE latent dimension (default: 8)')
+    parser.add_argument('--cvae-epochs', type=int, default=100,
+                        help='CVAE pretraining epochs (default: 100)')
+    parser.add_argument('--cvae-beta', type=float, default=0.1,
+                        help='CVAE KL weight (default: 0.1)')
+    parser.add_argument('--cvae-lr', type=float, default=1e-3,
+                        help='CVAE pretraining learning rate (default: 1e-3)')
 
     # Environment arguments
     parser.add_argument('--reward-mode', choices=['dense', 'sparse'], default='dense',
@@ -539,18 +442,6 @@ Examples:
     parser.add_argument('--more-debug', action='store_true',
                         help='Print per-episode stats')
 
-    # LiDAR VAE arguments
-    parser.add_argument('--lidar-mlp-vae', action='store_true',
-                        help='Use DreamerV3-style MLP-VAE for LiDAR preprocessing')
-    parser.add_argument('--vae-epochs', type=int, default=100,
-                        help='VAE pretraining epochs (default: 100)')
-    parser.add_argument('--vae-beta', type=float, default=0.1,
-                        help='VAE KL divergence weight (default: 0.1)')
-    parser.add_argument('--vae-aux-freq', type=int, default=10,
-                        help='VAE auxiliary loss frequency in steps (default: 10)')
-    parser.add_argument('--vae-aux-lr', type=float, default=1e-4,
-                        help='VAE auxiliary loss learning rate (default: 1e-4)')
-
     # Output arguments
     parser.add_argument('--output', type=str, default='models/tqc_jetbot.zip',
                         help='Output model path (default: models/tqc_jetbot.zip)')
@@ -569,19 +460,22 @@ Examples:
         ent_coef = float(ent_coef)
 
     print("=" * 60)
-    print("SAC/TQC + RLPD Training for Jetbot Navigation")
+    print("SAC/TQC + Chunk CVAE + Q-Chunking for Jetbot Navigation")
     print("=" * 60)
     print(f"  Timesteps: {args.timesteps:,}")
     print(f"  Demos: {args.demos}")
     print(f"  UTD ratio: {args.utd_ratio}")
+    print(f"  Chunk size: {args.chunk_size}")
     print(f"  Buffer size: {args.buffer_size:,}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Learning rate: {args.lr}")
-    print(f"  Gamma: {args.gamma}")
+    print(f"  Gamma: {args.gamma} (effective: {args.gamma ** args.chunk_size:.6f})")
     print(f"  Tau: {args.tau}")
     print(f"  Entropy coef: {ent_coef}")
     print(f"  Demo ratio: {args.demo_ratio}")
     print(f"  Learning starts: {args.learning_starts}")
+    print(f"  CVAE: z_dim={args.cvae_z_dim}, epochs={args.cvae_epochs}, "
+          f"beta={args.cvae_beta}, lr={args.cvae_lr}")
     print(f"  Reward mode: {args.reward_mode}")
     print(f"  Headless: {args.headless}")
     print(f"  Seed: {args.seed}")
@@ -590,12 +484,6 @@ Examples:
     print(f"  TensorBoard: {args.tensorboard_log}")
     if args.resume:
         print(f"  Resuming from: {args.resume}")
-    if args.lidar_mlp_vae:
-        print(f"  LiDAR MLP-VAE: enabled")
-        print(f"    VAE epochs: {args.vae_epochs}")
-        print(f"    VAE beta: {args.vae_beta}")
-        print(f"    VAE aux freq: {args.vae_aux_freq}")
-        print(f"    VAE aux lr: {args.vae_aux_lr}")
     print("=" * 60 + "\n")
 
     # Validate demo data first (fail fast)
@@ -603,12 +491,12 @@ Examples:
 
     # Import here to allow --help without Isaac Sim
     import torch
-    from jetbot_rl_env import JetbotNavigationEnv
+    from jetbot_rl_env import JetbotNavigationEnv, ChunkedEnvWrapper
     from stable_baselines3.common.vec_env import DummyVecEnv
     from stable_baselines3.common.buffers import ReplayBuffer
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, BaseCallback
-    if args.lidar_mlp_vae:
-        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+    from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+    from demo_utils import make_chunk_transitions
 
     # Try TQC first, fall back to SAC
     try:
@@ -623,7 +511,7 @@ Examples:
 
     print(f"Using algorithm: {algo_name}")
 
-    # Create environment (NO VecNormalize)
+    # Create environment with ChunkedEnvWrapper
     import time as _time
     print("\nCreating environment...")
     _t0 = _time.time()
@@ -636,27 +524,33 @@ Examples:
         workspace_bounds=workspace_bounds,
         max_episode_steps=args.max_steps,
         min_goal_dist=args.min_goal,
+        inflation_radius=args.inflation_radius,
     )
+    raw_env = ChunkedEnvWrapper(raw_env, chunk_size=args.chunk_size, gamma=args.gamma)
     print(f"  Environment created in {_time.time() - _t0:.1f}s")
     print(f"  Observation space: {raw_env.observation_space.shape}")
-    print(f"  Action space: {raw_env.action_space.shape}")
+    print(f"  Action space: {raw_env.action_space.shape} (chunk_size={args.chunk_size})")
 
     env = DummyVecEnv([lambda: raw_env])
     print("  No VecNormalize (using LayerNorm in critics instead)")
     print()
 
-    # Load demo transitions
+    # Load step-level demo transitions (for CVAE pretraining)
     print("Loading demo transitions...")
-    demo_obs, demo_actions, demo_rewards, demo_next_obs, demo_dones = \
+    demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step = \
         load_demo_transitions(args.demos)
+    demo_data = np.load(args.demos, allow_pickle=True)
+    episode_lengths = demo_data['episode_lengths']
 
-    # Pretrain LiDAR VAE if enabled
-    pretrained_vae = None
-    if args.lidar_mlp_vae:
-        pretrained_vae = pretrain_lidar_vae(
-            demo_obs, epochs=args.vae_epochs, beta=args.vae_beta)
+    # Build chunk-level transitions (for replay buffer)
+    print("Building chunk-level transitions...")
+    chunk_obs, chunk_acts, chunk_rews, chunk_next, chunk_dones = make_chunk_transitions(
+        demo_obs_step, demo_actions_step, demo_rewards_step, demo_dones_step,
+        episode_lengths, args.chunk_size, args.gamma)
+    print(f"  {len(chunk_obs)} chunk transitions from {len(episode_lengths)} episodes")
+    print()
 
-    # Create replay buffer with demo data
+    # Create replay buffer with chunk-level demo data
     device_str = "cpu" if args.cpu else "auto"
     device = torch.device("cpu") if args.cpu else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -668,15 +562,22 @@ Examples:
         raw_env.observation_space,
         raw_env.action_space,
         device=device,
-        demo_obs=demo_obs,
-        demo_actions=demo_actions,
-        demo_rewards=demo_rewards,
-        demo_next_obs=demo_next_obs,
-        demo_dones=demo_dones,
+        demo_obs=chunk_obs,
+        demo_actions=chunk_acts,
+        demo_rewards=chunk_rews,
+        demo_next_obs=chunk_next,
+        demo_dones=chunk_dones,
         demo_ratio=args.demo_ratio,
     )
-    print(f"Demo replay buffer created: {len(demo_obs)} demo transitions")
+    print(f"Demo replay buffer created: {len(chunk_obs)} chunk-level demo transitions")
     print()
+
+    # Effective gamma for chunk-level Bellman updates
+    effective_gamma = args.gamma ** args.chunk_size
+
+    # Feature extractor dimensions
+    obs_feature_dim = 96
+    features_dim = obs_feature_dim + args.cvae_z_dim
 
     # Create or resume model
     _t0 = _time.time()
@@ -688,29 +589,34 @@ Examples:
             device=device_str,
             tensorboard_log=args.tensorboard_log,
         )
+        # Verify chunk size matches
+        loaded_chunk = model.action_space.shape[0] // 2
+        if loaded_chunk != args.chunk_size:
+            print(f"  Warning: loaded model chunk_size={loaded_chunk} != --chunk-size={args.chunk_size}")
+            print(f"  Using loaded chunk_size={loaded_chunk}")
         # Override mutable hyperparams the user may have changed
         model.learning_rate = args.lr
         model.batch_size = args.batch_size
-        model.gamma = args.gamma
+        model.gamma = effective_gamma
         model.tau = args.tau
         model.gradient_steps = args.utd_ratio
         model.ent_coef = ent_coef
         # Replace replay buffer with fresh demo buffer (online data is lost)
         model.replay_buffer = replay_buffer
-        # LayerNorm is already baked into the loaded checkpoint weights
+        # LayerNorm + CVAE weights are already baked into the loaded checkpoint
         print(f"  Model resumed in {_time.time() - _t0:.1f}s")
     else:
         print(f"Creating {algo_name} model...")
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(
+            BaseFeaturesExtractor, z_dim=args.cvae_z_dim)
         policy_kwargs = dict(
             net_arch=dict(pi=[256, 256], qf=[256, 256]),
             activation_fn=torch.nn.ReLU,
+            features_extractor_class=fe_cls,
+            features_extractor_kwargs=dict(features_dim=features_dim),
         )
         if algo_name == "TQC":
             policy_kwargs['n_critics'] = 5
-        if args.lidar_mlp_vae:
-            vae_extractor_cls = LidarVAEFeatureExtractor.get_class(BaseFeaturesExtractor)
-            policy_kwargs['features_extractor_class'] = vae_extractor_cls
-            policy_kwargs['features_extractor_kwargs'] = dict(features_dim=48)
 
         model = algo_cls(
             "MlpPolicy",
@@ -722,9 +628,10 @@ Examples:
             learning_rate=args.lr,
             buffer_size=args.buffer_size,
             batch_size=args.batch_size,
-            gamma=args.gamma,
+            gamma=effective_gamma,
             tau=args.tau,
             ent_coef=ent_coef,
+            target_entropy=-2.0,
             gradient_steps=args.utd_ratio,
             learning_starts=args.learning_starts,
             train_freq=1,
@@ -734,25 +641,17 @@ Examples:
         model.replay_buffer = replay_buffer
         # Inject LayerNorm into critics
         inject_layernorm_into_critics(model)
-        # Inject pretrained VAE weights into all feature extractors
-        if args.lidar_mlp_vae and pretrained_vae is not None:
-            model.actor.features_extractor.vae.load_state_dict(pretrained_vae.state_dict())
-            model.critic.features_extractor.vae.load_state_dict(pretrained_vae.state_dict())
-            model.critic_target.features_extractor.vae.load_state_dict(pretrained_vae.state_dict())
-            print("Pretrained VAE weights injected into actor/critic/critic_target")
         print(f"  Model created in {_time.time() - _t0:.1f}s")
     print()
 
-    # BC warmstart on actor
-    bc_warmstart_sac(model, demo_obs, demo_actions,
-                     epochs=args.bc_epochs, batch_size=args.bc_batch_size, lr=args.bc_lr,
-                     include_feature_extractor=args.lidar_mlp_vae)
-
-    # Tighten exploration noise to preserve BC-learned behavior
-    # log_std is a Linear layer; zero weights + low bias → constant std ≈ 0.135
-    model.actor.log_std.weight.data.zero_()
-    model.actor.log_std.bias.data.fill_(-2.0)
-    print("Exploration noise tightened (log_std bias = -2.0, std ≈ 0.135)")
+    # CVAE pretraining (replaces BC warmstart)
+    if not args.resume:
+        pretrain_chunk_cvae(
+            model, demo_obs_step, demo_actions_step, episode_lengths,
+            chunk_size=args.chunk_size, z_dim=args.cvae_z_dim,
+            epochs=args.cvae_epochs, batch_size=args.batch_size,
+            lr=args.cvae_lr, beta=args.cvae_beta, gamma=args.gamma,
+        )
 
     # Create callbacks
     checkpoint_dir = Path(args.output).parent / "checkpoints"
@@ -768,15 +667,11 @@ Examples:
     callbacks = [checkpoint_callback]
     if args.more_debug:
         callbacks.append(VerboseEpisodeCallback.create(BaseCallback))
-    if args.lidar_mlp_vae:
-        callbacks.append(VAEAuxLossCallback.create(
-            BaseCallback, aux_freq=args.vae_aux_freq,
-            beta=args.vae_beta, aux_lr=args.vae_aux_lr))
     callback = CallbackList(callbacks)
 
     # Train
     print("\n" + "=" * 60)
-    print(f"Starting {algo_name} + RLPD Training")
+    print(f"Starting {algo_name} + Chunk CVAE + Q-Chunking Training")
     print("=" * 60)
     print(f"View TensorBoard: tensorboard --logdir {args.tensorboard_log}")
     print("=" * 60 + "\n")

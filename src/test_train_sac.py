@@ -55,11 +55,11 @@ from train_sac import (
     load_demo_transitions,
     inject_layernorm_into_critics,
     symlog,
-    LidarMLPVAE,
-    pretrain_lidar_vae,
-    LidarVAEFeatureExtractor,
-    bc_warmstart_sac,
+    ChunkCVAEFeatureExtractor,
+    pretrain_chunk_cvae,
 )
+from demo_utils import extract_action_chunks, make_chunk_transitions
+from jetbot_rl_env import ChunkedEnvWrapper
 
 
 # ============================================================================
@@ -76,8 +76,14 @@ def make_demo_npz(path, num_episodes=20, steps_per_ep=50, obs_dim=34,
     episode_lengths = np.full(num_episodes, steps_per_ep)
     episode_success = np.zeros(num_episodes, dtype=bool)
     episode_success[:int(num_episodes * success_rate)] = True
+    # Build dones: 1.0 at end of each episode, 0.0 elsewhere
+    dones = np.zeros(total, dtype=np.float32)
+    offset = 0
+    for length in episode_lengths:
+        dones[offset + length - 1] = 1.0
+        offset += length
     np.savez(path,
-             observations=obs, actions=actions, rewards=rewards,
+             observations=obs, actions=actions, rewards=rewards, dones=dones,
              episode_lengths=episode_lengths, episode_success=episode_success)
     return path
 
@@ -495,183 +501,272 @@ class TestSymlog:
 
 
 # ============================================================================
-# TEST SUITE: LidarMLPVAE
+# TEST SUITE: ChunkedEnvWrapper
 # ============================================================================
 
-class TestLidarMLPVAE:
-    def test_output_shapes(self):
-        """Forward pass returns correct shapes for z, mu, logvar, recon."""
-        import torch
-        vae = LidarMLPVAE.create()
-        x = torch.randn(8, 24)
-        z, mu, logvar, recon = vae(x)
-        assert z.shape == (8, 16)
-        assert mu.shape == (8, 16)
-        assert logvar.shape == (8, 16)
-        assert recon.shape == (8, 24)
+class TestChunkedEnvWrapper:
+    def _make_mock_env(self, obs_dim=34, act_dim=2):
+        """Create a minimal gymnasium.Env subclass for testing."""
+        import gymnasium as gym
 
-    def test_encode_shapes(self):
-        """Encode returns (mu, logvar) with correct shapes."""
-        import torch
-        vae = LidarMLPVAE.create()
-        x = torch.randn(4, 24)
-        mu, logvar = vae.encode(x)
-        assert mu.shape == (4, 16)
-        assert logvar.shape == (4, 16)
+        class _MinimalEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
 
-    def test_decode_shapes(self):
-        """Decode returns reconstruction with correct shape."""
-        import torch
-        vae = LidarMLPVAE.create()
-        z = torch.randn(4, 16)
-        recon = vae.decode(z)
-        assert recon.shape == (4, 24)
+            def reset(self, **kwargs):
+                return np.zeros(obs_dim, dtype=np.float32), {}
 
-    def test_deterministic_eval(self):
-        """In eval mode, reparameterize returns mu (deterministic)."""
-        import torch
-        vae = LidarMLPVAE.create()
-        vae.eval()
-        x = torch.randn(4, 24)
-        z1, mu1, _, _ = vae(x)
-        z2, mu2, _, _ = vae(x)
-        torch.testing.assert_close(z1, z2)
-        torch.testing.assert_close(z1, mu1)
+            def step(self, action):
+                return np.zeros(obs_dim, dtype=np.float32), 0.0, False, False, {}
 
-    def test_stochastic_train(self):
-        """In train mode, reparameterize is stochastic (z != mu with high probability)."""
-        import torch
-        vae = LidarMLPVAE.create()
-        vae.train()
-        x = torch.randn(32, 24)
-        z, mu, _, _ = vae(x)
-        # With 32 samples and 16 latent dims, z should differ from mu
-        assert not torch.allclose(z, mu, atol=1e-6)
+        return _MinimalEnv()
 
-    def test_custom_dims(self):
-        """Custom input_dim, hidden_dim, latent_dim work correctly."""
-        import torch
-        vae = LidarMLPVAE.create(input_dim=12, hidden_dim=64, latent_dim=8)
-        x = torch.randn(4, 12)
-        z, mu, logvar, recon = vae(x)
-        assert z.shape == (4, 8)
-        assert recon.shape == (4, 12)
+    def test_action_space_shape(self):
+        """Wrapper action space is (chunk_size * 2,)."""
+        inner = self._make_mock_env()
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=5, gamma=0.99)
+        assert wrapper.action_space.shape == (10,)
+
+    def test_observation_space_unchanged(self):
+        """Observation space is unchanged by wrapper."""
+        inner = self._make_mock_env()
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=5, gamma=0.99)
+        assert wrapper.observation_space.shape == (34,)
+
+    def test_cumulative_reward(self):
+        """Verify R_chunk = sum(gamma^i * r_i)."""
+        inner = self._make_mock_env()
+        k = 3
+        gamma = 0.9
+        rewards = [1.0, 2.0, 3.0]
+        obs = np.zeros(34, dtype=np.float32)
+
+        call_count = [0]
+        def mock_step(action):
+            r = rewards[call_count[0]]
+            call_count[0] += 1
+            return obs, r, False, False, {}
+
+        inner.step = mock_step
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=k, gamma=gamma)
+
+        action_flat = np.zeros(k * 2, dtype=np.float32)
+        _, r_chunk, terminated, truncated, _ = wrapper.step(action_flat)
+
+        expected = 1.0 + 0.9 * 2.0 + 0.81 * 3.0
+        assert abs(r_chunk - expected) < 1e-6
+
+    def test_early_termination(self):
+        """Inner env terminates mid-chunk -> partial reward + done=True."""
+        inner = self._make_mock_env()
+        k = 5
+        obs = np.zeros(34, dtype=np.float32)
+
+        call_count = [0]
+        def mock_step(action):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                return obs, 10.0, True, False, {}  # terminate at step 2
+            return obs, 1.0, False, False, {}
+
+        inner.step = mock_step
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=k, gamma=0.99)
+
+        action_flat = np.zeros(k * 2, dtype=np.float32)
+        _, r_chunk, terminated, truncated, _ = wrapper.step(action_flat)
+
+        assert terminated is True
+        assert call_count[0] == 2  # Only 2 inner steps executed
+        expected = 1.0 + 0.99 * 10.0
+        assert abs(r_chunk - expected) < 1e-6
+
+    def test_full_chunk_execution(self):
+        """All k sub-steps execute when no termination."""
+        inner = self._make_mock_env()
+        k = 4
+        obs = np.zeros(34, dtype=np.float32)
+
+        call_count = [0]
+        def mock_step(action):
+            call_count[0] += 1
+            return obs, 1.0, False, False, {}
+
+        inner.step = mock_step
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=k, gamma=0.99)
+
+        action_flat = np.zeros(k * 2, dtype=np.float32)
+        wrapper.step(action_flat)
+
+        assert call_count[0] == k
 
 
 # ============================================================================
-# TEST SUITE: PretrainLidarVAE
+# TEST SUITE: ChunkCVAEFeatureExtractor
 # ============================================================================
 
-class TestPretrainLidarVAE:
-    def test_returns_eval_mode_vae(self):
-        """Pretrained VAE is returned in eval mode."""
-        demo_obs = np.random.randn(200, 34).astype(np.float32)
-        vae = pretrain_lidar_vae(demo_obs, epochs=5, batch_size=64)
-        assert not vae.training
-
-    def test_reconstruction_improves(self):
-        """Reconstruction loss decreases over training."""
-        import torch
-        demo_obs = np.random.randn(500, 34).astype(np.float32)
-        # Untrained VAE
-        vae_untrained = LidarMLPVAE.create()
-        vae_untrained.eval()
-        lidar = symlog(torch.tensor(demo_obs[:, 10:34]))
-        with torch.no_grad():
-            _, _, _, recon_before = vae_untrained(lidar)
-            loss_before = torch.nn.functional.mse_loss(recon_before, lidar).item()
-
-        # Trained VAE
-        vae_trained = pretrain_lidar_vae(demo_obs, vae=LidarMLPVAE.create(), epochs=50, batch_size=64)
-        with torch.no_grad():
-            _, _, _, recon_after = vae_trained(lidar)
-            loss_after = torch.nn.functional.mse_loss(recon_after, lidar).item()
-
-        assert loss_after < loss_before, \
-            f"Reconstruction should improve: {loss_after:.4f} >= {loss_before:.4f}"
-
-    def test_accepts_prebuilt_vae(self):
-        """Can pass in a pre-built VAE to pretrain."""
-        demo_obs = np.random.randn(200, 34).astype(np.float32)
-        vae = LidarMLPVAE.create(latent_dim=8)
-        result = pretrain_lidar_vae(demo_obs, vae=vae, epochs=5, batch_size=64)
-        assert result is vae
-        assert result.latent_dim == 8
-
-
-# ============================================================================
-# TEST SUITE: LidarVAEFeatureExtractor
-# ============================================================================
-
-class TestLidarVAEFeatureExtractor:
-    def _make_extractor(self, pretrained_vae=None):
+class TestChunkCVAEFeatureExtractor:
+    def _make_extractor(self, z_dim=8):
         import torch
         import gymnasium as gym
         from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
         obs_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
-        cls = LidarVAEFeatureExtractor.create(BaseFeaturesExtractor)
-        return cls(obs_space, features_dim=48, pretrained_vae=pretrained_vae)
+        cls = ChunkCVAEFeatureExtractor.create(BaseFeaturesExtractor, z_dim=z_dim)
+        features_dim = 96 + z_dim
+        return cls(obs_space, features_dim=features_dim)
 
     def test_output_shape(self):
-        """Feature extractor produces 48D output from 34D input."""
+        """Feature extractor produces (batch, 104) from (batch, 34)."""
         import torch
-        ext = self._make_extractor()
+        ext = self._make_extractor(z_dim=8)
         obs = torch.randn(8, 34)
         out = ext(obs)
-        assert out.shape == (8, 48)
+        assert out.shape == (8, 104)
 
-    def test_features_dim(self):
-        """features_dim attribute is 48."""
-        ext = self._make_extractor()
-        assert ext.features_dim == 48
-
-    def test_pretrained_weights(self):
-        """Pretrained VAE weights are used when provided."""
+    def test_z_slot_is_zero(self):
+        """Last z_dim entries are zeros during forward()."""
         import torch
-        vae = LidarMLPVAE.create()
-        # Set a known weight
-        vae.mu_head.bias.data.fill_(42.0)
-        ext = self._make_extractor(pretrained_vae=vae)
-        torch.testing.assert_close(
-            ext.vae.mu_head.bias.data,
-            torch.full_like(ext.vae.mu_head.bias.data, 42.0)
-        )
-
-    def test_eval_determinism(self):
-        """In eval mode, same input produces same output."""
-        import torch
-        ext = self._make_extractor()
-        ext.eval()
+        z_dim = 8
+        ext = self._make_extractor(z_dim=z_dim)
         obs = torch.randn(4, 34)
-        out1 = ext(obs)
-        out2 = ext(obs)
-        torch.testing.assert_close(out1, out2)
+        out = ext(obs)
+        z_slot = out[:, -z_dim:]
+        torch.testing.assert_close(z_slot, torch.zeros(4, z_dim))
+
+    def test_encode_obs_shape(self):
+        """encode_obs returns (batch, 96)."""
+        import torch
+        ext = self._make_extractor(z_dim=8)
+        obs = torch.randn(4, 34)
+        obs_features = ext.encode_obs(obs)
+        assert obs_features.shape == (4, 96)
 
     def test_gradient_flow(self):
-        """Gradients flow through the feature extractor."""
+        """Gradients flow through state_mlp and lidar_mlp."""
         import torch
-        ext = self._make_extractor()
+        ext = self._make_extractor(z_dim=8)
         ext.train()
-        obs = torch.randn(4, 34, requires_grad=False)
+        obs = torch.randn(4, 34)
         out = ext(obs)
         loss = out.sum()
         loss.backward()
-        # Check that state MLP has gradients
+        # Check state MLP gradients
         assert ext.state_mlp[0].weight.grad is not None
-        # Check that VAE encoder has gradients
-        assert ext.vae.mu_head.weight.grad is not None
+        # Check lidar MLP gradients
+        assert ext.lidar_mlp[0].weight.grad is not None
 
 
 # ============================================================================
-# TEST SUITE: BCWarmstartWithFeatureExtractor
+# TEST SUITE: ExtractActionChunks
 # ============================================================================
 
-class TestBCWarmstartWithFeatureExtractor:
-    def test_include_feature_extractor_param_exists(self):
-        """bc_warmstart_sac accepts include_feature_extractor parameter."""
-        import inspect
-        sig = inspect.signature(bc_warmstart_sac)
-        assert 'include_feature_extractor' in sig.parameters
-        # Default should be False
-        assert sig.parameters['include_feature_extractor'].default is False
+class TestExtractActionChunks:
+    def test_chunk_count(self):
+        """N_chunks = sum(max(0, L_i - k + 1)) for each episode."""
+        # 2 episodes, 10 steps each, chunk_size=3
+        # Each episode: 10 - 3 + 1 = 8 chunks, total = 16
+        total = 20
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        ep_lengths = np.array([10, 10])
+
+        chunk_obs, chunk_acts = extract_action_chunks(obs, actions, ep_lengths, chunk_size=3)
+        assert len(chunk_obs) == 16
+        assert chunk_acts.shape == (16, 6)  # 3 * 2 = 6
+
+    def test_respects_episode_boundaries(self):
+        """No chunk spans two episodes."""
+        # 2 episodes of 5 steps each, chunk_size=3
+        total = 10
+        obs = np.arange(total * 34, dtype=np.float32).reshape(total, 34)
+        actions = np.arange(total * 2, dtype=np.float32).reshape(total, 2)
+        ep_lengths = np.array([5, 5])
+
+        chunk_obs, chunk_acts = extract_action_chunks(obs, actions, ep_lengths, chunk_size=3)
+
+        # Episode 1: chunks starting at t=0,1,2 (indices 0-4)
+        # Episode 2: chunks starting at t=5,6,7 (indices 5-9)
+        # Total: 6 chunks
+        assert len(chunk_obs) == 6
+
+        # First chunk of episode 2 should start at obs[5], not use obs from episode 1
+        # The 4th chunk (index 3) is the first of episode 2
+        np.testing.assert_array_equal(chunk_obs[3], obs[5])
+
+    def test_short_episodes_skipped(self):
+        """Episodes shorter than chunk_size produce no chunks."""
+        total = 12
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        ep_lengths = np.array([2, 10])  # First ep too short for chunk_size=5
+
+        chunk_obs, chunk_acts = extract_action_chunks(obs, actions, ep_lengths, chunk_size=5)
+        # Only second episode: 10 - 5 + 1 = 6 chunks
+        assert len(chunk_obs) == 6
+
+
+# ============================================================================
+# TEST SUITE: MakeChunkTransitions
+# ============================================================================
+
+class TestMakeChunkTransitions:
+    def test_discounted_reward(self):
+        """R_chunk matches hand-computed sum(gamma^i * r_i)."""
+        total = 10
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        rewards = np.ones(total, dtype=np.float32)
+        dones = np.zeros(total, dtype=np.float32)
+        dones[9] = 1.0  # Terminal at end
+        ep_lengths = np.array([10])
+        gamma = 0.9
+        k = 3
+
+        c_obs, c_acts, c_rews, c_next, c_dones = make_chunk_transitions(
+            obs, actions, rewards, dones, ep_lengths, k, gamma)
+
+        # First chunk: r0 + 0.9*r1 + 0.81*r2 = 1 + 0.9 + 0.81 = 2.71
+        expected = 1.0 + 0.9 + 0.81
+        assert abs(c_rews[0] - expected) < 1e-6
+
+    def test_next_obs_alignment(self):
+        """next_obs is observation k steps ahead."""
+        total = 10
+        obs = np.arange(total * 34, dtype=np.float32).reshape(total, 34)
+        actions = np.zeros((total, 2), dtype=np.float32)
+        rewards = np.ones(total, dtype=np.float32)
+        dones = np.zeros(total, dtype=np.float32)
+        dones[9] = 1.0
+        ep_lengths = np.array([10])
+        k = 3
+
+        c_obs, c_acts, c_rews, c_next, c_dones = make_chunk_transitions(
+            obs, actions, rewards, dones, ep_lengths, k, 0.99)
+
+        # First chunk starts at t=0, next_obs should be obs[3]
+        np.testing.assert_array_equal(c_next[0], obs[3])
+        # Second chunk starts at t=1, next_obs should be obs[4]
+        np.testing.assert_array_equal(c_next[1], obs[4])
+
+    def test_terminal_chunk(self):
+        """done=True for chunks containing terminal steps."""
+        total = 10
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        rewards = np.ones(total, dtype=np.float32)
+        dones = np.zeros(total, dtype=np.float32)
+        dones[9] = 1.0  # Terminal at last step
+        ep_lengths = np.array([10])
+        k = 3
+
+        c_obs, c_acts, c_rews, c_next, c_dones = make_chunk_transitions(
+            obs, actions, rewards, dones, ep_lengths, k, 0.99)
+
+        # Last chunk starts at t=7 (covers steps 7,8,9), step 9 is terminal
+        assert c_dones[-1] == 1.0
+        # First chunk (steps 0,1,2) should not be terminal
+        assert c_dones[0] == 0.0

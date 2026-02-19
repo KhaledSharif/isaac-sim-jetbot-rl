@@ -753,6 +753,7 @@ class TestReset:
             env.scene_manager.get_goal_position.return_value = np.array([1.0, 1.0, 0.0])
             env.scene_manager.check_goal_reached.return_value = False
             env.scene_manager.get_obstacle_metadata.return_value = []
+            env.inflation_radius = 0.08
 
             # Need np_random for reset()
             env.np_random = np.random.default_rng(42)
@@ -762,16 +763,20 @@ class TestReset:
     def test_step_count_reset(self, env):
         with patch.object(type(env), '_get_robot_pose',
                          return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
-            # Patch super().reset to not call gymnasium.Env.reset
-            with patch('gymnasium.Env.reset', return_value=None):
-                env.reset()
+            with patch('jetbot_rl_env.astar_search', return_value=[(0, 0)]):
+                with patch('jetbot_rl_env.OccupancyGrid.from_scene'):
+                    # Patch super().reset to not call gymnasium.Env.reset
+                    with patch('gymnasium.Env.reset', return_value=None):
+                        env.reset()
             assert env._step_count == 0
 
     def test_returns_obs_and_info(self, env):
         with patch.object(type(env), '_get_robot_pose',
                          return_value=(np.array([0.0, 0.0, 0.05]), 0.0)):
-            with patch('gymnasium.Env.reset', return_value=None):
-                result = env.reset()
+            with patch('jetbot_rl_env.astar_search', return_value=[(0, 0)]):
+                with patch('jetbot_rl_env.OccupancyGrid.from_scene'):
+                    with patch('gymnasium.Env.reset', return_value=None):
+                        result = env.reset()
             assert len(result) == 2
             obs, info = result
             assert obs.shape == (34,)

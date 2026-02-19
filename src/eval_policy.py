@@ -70,6 +70,10 @@ Examples:
                         help='Random seed for reproducibility')
     parser.add_argument('--vecnormalize', type=str, default=None, metavar='PKL_FILE',
                         help='Path to VecNormalize stats .pkl file (auto-detected if not given)')
+    parser.add_argument('--chunk-size', type=int, default=None,
+                        help='Action chunk size (default: auto-detect from model)')
+    parser.add_argument('--inflation-radius', type=float, default=0.08,
+                        help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
 
     args = parser.parse_args()
 
@@ -97,8 +101,8 @@ Examples:
     print("=" * 60 + "\n")
 
     # Import here to allow --help without Isaac Sim
-    import train_sac  # noqa: F401 — registers LidarVAEFeatureExtractor for model deserialization
-    from jetbot_rl_env import JetbotNavigationEnv
+    import train_sac  # noqa: F401 — registers ChunkCVAEFeatureExtractor for model deserialization
+    from jetbot_rl_env import JetbotNavigationEnv, ChunkedEnvWrapper
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -113,9 +117,10 @@ Examples:
     raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
         headless=args.headless,
+        inflation_radius=args.inflation_radius,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
-    print(f"  Action space: {raw_env.action_space.shape}")
+    print(f"  Action space (inner): {raw_env.action_space.shape}")
 
     # Wrap with VecNormalize if stats file exists
     vec_env = DummyVecEnv([lambda: raw_env])
@@ -138,15 +143,16 @@ Examples:
         print("  VecNormalize stats: not found (using raw observations)")
     print()
 
-    # Load trained policy (auto-detect algorithm)
+    # Load trained policy (auto-detect algorithm) — load without env first to detect chunk size
     print(f"Loading policy from {args.policy_path}...")
     model = None
+    algo_used = None
     for algo_cls, name in [(TQC, "TQC"), (SAC, "SAC"), (PPO, "PPO")]:
         if algo_cls is None:
             continue
         try:
-            model = algo_cls.load(args.policy_path, env=vec_env)
-            print(f"Loaded as {name} policy successfully!\n")
+            model = algo_cls.load(args.policy_path)
+            algo_used = name
             break
         except Exception:
             continue
@@ -154,6 +160,29 @@ Examples:
         print("Error: Could not load policy with any supported algorithm (TQC/SAC/PPO)")
         vec_env.close()
         return 1
+
+    # Auto-detect chunk size from model action space
+    model_action_dim = model.action_space.shape[0]
+    chunk_size = args.chunk_size
+    if chunk_size is None and model_action_dim > 2:
+        chunk_size = model_action_dim // 2
+        print(f"  Auto-detected chunk_size={chunk_size} from model action_dim={model_action_dim}")
+
+    # Wrap env with ChunkedEnvWrapper if chunked model
+    if chunk_size is not None and chunk_size > 1:
+        raw_env = ChunkedEnvWrapper(raw_env, chunk_size=chunk_size, gamma=0.99)
+        # Recreate vec_env with the wrapped env
+        vec_env = DummyVecEnv([lambda: raw_env])
+        if vecnorm_path and vecnorm_path.exists():
+            vec_env = VecNormalize.load(str(vecnorm_path), vec_env)
+            vec_env.training = False
+            vec_env.norm_reward = False
+        print(f"  Wrapped env with ChunkedEnvWrapper(k={chunk_size})")
+        print(f"  Action space (chunked): {raw_env.action_space.shape}")
+
+    # Re-load model with the (possibly wrapped) env
+    model.set_env(vec_env)
+    print(f"Loaded as {algo_used} policy successfully!\n")
 
     # Evaluation metrics
     successes = 0
@@ -211,7 +240,8 @@ Examples:
     print("=" * 60)
     print(f"  Success rate:      {successes}/{args.episodes} ({metrics['success_rate']:.1f}%)")
     print(f"  Average reward:    {metrics['avg_reward']:.2f} +/- {metrics['std_reward']:.2f}")
-    print(f"  Average length:    {metrics['avg_length']:.1f} +/- {metrics['std_length']:.1f} steps")
+    step_label = f"chunk-steps (k={chunk_size})" if chunk_size and chunk_size > 1 else "steps"
+    print(f"  Average length:    {metrics['avg_length']:.1f} +/- {metrics['std_length']:.1f} {step_label}")
     print(f"  Min reward:        {metrics['min_reward']:.2f}")
     print(f"  Max reward:        {metrics['max_reward']:.2f}")
     print("=" * 60)

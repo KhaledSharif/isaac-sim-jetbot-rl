@@ -21,6 +21,8 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - Gymnasium-compatible RL environment
    - Navigation task: drive to goal position
    - Dense/sparse reward modes
+   - A* solvability check on `reset()`: retries goal+obstacle layouts until A* finds a valid path (up to 20 attempts)
+   - `inflation_radius` parameter controls obstacle inflation for A* solvability checks (default 0.08m)
 
 3. **Training Pipeline** (`src/train_rl.py`)
    - PPO training with BC warmstart from demonstrations
@@ -39,7 +41,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - `--chunk-size` to control action chunk length (default 10)
 
 5. **Supporting Scripts**
-   - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO)
+   - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO and chunk size from model action space; wraps env with `ChunkedEnvWrapper` for chunked models)
    - `train_bc.py` - Behavioral cloning from demonstrations
    - `replay.py` - Demo playback and inspection
 
@@ -173,9 +175,12 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # Resume SAC/TQC training from checkpoint
 ./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
 
-# Evaluation (auto-detects TQC/SAC/PPO)
+# Evaluation (auto-detects TQC/SAC/PPO and chunk size)
 ./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100
 ./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
+
+# Evaluation with explicit chunk size or inflation radius
+./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
 
 # Tests
 ./run_tests.sh
@@ -188,12 +193,12 @@ isaac-sim-jetbot-keyboard/
 ├── src/
 │   ├── jetbot_keyboard_control.py    # Main teleoperation app
 │   ├── jetbot_config.py              # Shared robot constants & quaternion_to_yaw()
-│   ├── demo_utils.py                 # Shared demo loading/validation & VerboseEpisodeCallback
+│   ├── demo_utils.py                 # Shared demo loading/validation, chunk extraction & VerboseEpisodeCallback
 │   ├── camera_streamer.py            # Camera streaming module
-│   ├── jetbot_rl_env.py              # Gymnasium RL environment
+│   ├── jetbot_rl_env.py              # Gymnasium RL environment + ChunkedEnvWrapper
 │   ├── train_rl.py                   # PPO training script
-│   ├── train_sac.py                  # SAC/TQC + RLPD training script
-│   ├── eval_policy.py                # Policy evaluation (auto-detects TQC/SAC/PPO)
+│   ├── train_sac.py                  # SAC/TQC + Chunk CVAE + Q-Chunking training script
+│   ├── eval_policy.py                # Policy evaluation (auto-detects TQC/SAC/PPO + chunk size)
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py

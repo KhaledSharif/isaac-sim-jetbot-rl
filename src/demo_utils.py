@@ -160,6 +160,113 @@ def load_demo_transitions(npz_path: str):
     return observations, actions, rewards, next_obs, dones
 
 
+def extract_action_chunks(demo_obs, demo_actions, episode_lengths, chunk_size):
+    """Extract action chunks using a sliding window within each episode.
+
+    Args:
+        demo_obs: numpy array of observations (N, obs_dim)
+        demo_actions: numpy array of actions (N, act_dim)
+        episode_lengths: numpy array of per-episode step counts
+        chunk_size: number of actions per chunk (k)
+
+    Returns:
+        Tuple of (chunk_obs, chunk_actions_flat) — shapes (M, obs_dim) and (M, k*act_dim)
+    """
+    act_dim = demo_actions.shape[1]
+    chunk_obs_list = []
+    chunk_actions_list = []
+
+    offset = 0
+    for ep_idx, length in enumerate(episode_lengths):
+        length = int(length)
+        if length < chunk_size:
+            print(f"  Warning: episode {ep_idx} has {length} steps < chunk_size {chunk_size}, skipping")
+            offset += length
+            continue
+        for t in range(length - chunk_size + 1):
+            chunk_obs_list.append(demo_obs[offset + t])
+            chunk_actions_list.append(
+                demo_actions[offset + t:offset + t + chunk_size].reshape(-1)
+            )
+        offset += length
+
+    chunk_obs = np.array(chunk_obs_list, dtype=np.float32)
+    chunk_actions_flat = np.array(chunk_actions_list, dtype=np.float32)
+    print(f"Extracted {len(chunk_obs)} action chunks (k={chunk_size}) from {len(episode_lengths)} episodes")
+    return chunk_obs, chunk_actions_flat
+
+
+def make_chunk_transitions(demo_obs, demo_actions, demo_rewards, demo_dones,
+                           episode_lengths, chunk_size, gamma):
+    """Build chunk-level (obs, action, reward, next_obs, done) transitions.
+
+    Uses a sliding window within each episode. For terminal chunks where the
+    episode ends at step j < k, the partial chunk is included with truncated
+    reward sum and done=True.
+
+    Args:
+        demo_obs: numpy array of observations (N, obs_dim)
+        demo_actions: numpy array of actions (N, act_dim)
+        demo_rewards: numpy array of rewards (N,)
+        demo_dones: numpy array of dones (N,)
+        episode_lengths: numpy array of per-episode step counts
+        chunk_size: number of actions per chunk (k)
+        gamma: discount factor for computing R_chunk
+
+    Returns:
+        Tuple of (chunk_obs, chunk_actions, chunk_rewards, chunk_next_obs, chunk_dones)
+    """
+    act_dim = demo_actions.shape[1]
+    obs_dim = demo_obs.shape[1]
+
+    c_obs, c_acts, c_rews, c_next, c_dones = [], [], [], [], []
+
+    offset = 0
+    for ep_idx, length in enumerate(episode_lengths):
+        length = int(length)
+        if length < chunk_size:
+            print(f"  Warning: episode {ep_idx} has {length} steps < chunk_size {chunk_size}, skipping")
+            offset += length
+            continue
+
+        for t in range(length - chunk_size + 1):
+            abs_t = offset + t
+            # Observation at chunk start
+            c_obs.append(demo_obs[abs_t])
+
+            # Action chunk (full k steps)
+            c_acts.append(demo_actions[abs_t:abs_t + chunk_size].reshape(-1))
+
+            # Discounted reward sum and terminal check
+            r_chunk = 0.0
+            done_any = False
+            for i in range(chunk_size):
+                r_chunk += (gamma ** i) * demo_rewards[abs_t + i]
+                if demo_dones[abs_t + i]:
+                    done_any = True
+
+            c_rews.append(r_chunk)
+            c_dones.append(float(done_any))
+
+            # Next obs = observation after the full chunk
+            next_idx = abs_t + chunk_size
+            if next_idx < offset + length:
+                c_next.append(demo_obs[next_idx])
+            else:
+                # End of episode: next_obs is the last obs (masked by done=True)
+                c_next.append(demo_obs[offset + length - 1])
+
+        offset += length
+
+    return (
+        np.array(c_obs, dtype=np.float32),
+        np.array(c_acts, dtype=np.float32),
+        np.array(c_rews, dtype=np.float32),
+        np.array(c_next, dtype=np.float32),
+        np.array(c_dones, dtype=np.float32),
+    )
+
+
 class VerboseEpisodeCallback:
     """Prints episode stats and periodic step-rate info during training.
 
