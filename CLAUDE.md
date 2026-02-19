@@ -28,14 +28,15 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - Critic pretraining on Monte Carlo returns
    - Pipeline: validate → prewarm VecNormalize → BC warmstart → critic pretrain → PPO
 
-4. **SAC/TQC + RLPD Pipeline** (`src/train_sac.py`)
+4. **SAC/TQC + Chunk CVAE + Q-Chunking Pipeline** (`src/train_sac.py`)
    - TQC (sb3-contrib) with SAC fallback
+   - **Chunk CVAE**: Actor predicts k-step action chunks; CVAE handles multimodal demos
+   - **Q-chunking**: `ChunkedEnvWrapper` makes critic evaluate chunk-level Q-values
    - RLPD-style demo/online replay buffer sampling (configurable via `--demo-ratio`)
    - LayerNorm in critics (replaces VecNormalize)
    - UTD ratio configurable via `--utd-ratio` (default 20, recommended 5 for speed)
-   - No VecNormalize/critic pretraining — demos sampled continuously (BC warmstart still runs)
    - `--resume` to continue training from a checkpoint (step counter, weights preserved)
-   - Optional `--lidar-mlp-vae` for DreamerV3-style LiDAR latent compression
+   - `--chunk-size` to control action chunk length (default 10)
 
 5. **Supporting Scripts**
    - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO)
@@ -44,7 +45,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 
 6. **Shared Modules**
    - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds) and `quaternion_to_yaw()` utility
-   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, and `VerboseEpisodeCallback`
+   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, and `VerboseEpisodeCallback`
 
 ### Key Classes
 
@@ -59,9 +60,9 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
 - **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
-- **LidarMLPVAE**: MLP-based VAE for compressing 24D LiDAR to 16D latent (factory pattern via `LidarMLPVAE.create()`)
-- **LidarVAEFeatureExtractor**: SB3 custom feature extractor splitting obs into state MLP (10→32D) + VAE encoder (24→16D) = 48D
-- **VAEAuxLossCallback**: SB3 callback applying auxiliary VAE reconstruction+KL loss during RL training
+- **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`)
+- **ChunkCVAEFeatureExtractor**: SB3 feature extractor splitting obs into state MLP (10→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D
+- **pretrain_chunk_cvae()**: CVAE pretraining — encoder maps (obs, action_chunk) → z, decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk; encoder discarded after pretraining
 
 ### Training Pipeline Functions (`src/train_rl.py`)
 
@@ -156,21 +157,18 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # PPO Training with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
-# SAC/TQC + RLPD Training (recommended — demos in replay buffer, no pretraining needed)
+# SAC/TQC + Chunk CVAE + Q-Chunking (recommended)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
 
-# SAC/TQC with custom UTD ratio and buffer size
-./run.sh train_sac.py --demos demos/recording.npz --headless --utd-ratio 20 --buffer-size 300000
+# Custom chunk size and UTD ratio
+./run.sh train_sac.py --demos demos/recording.npz --headless --chunk-size 5 --utd-ratio 5
 
 # SAC/TQC with custom demo ratio (75% demo, 25% online)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --demo-ratio 0.75
 
-# SAC/TQC with LiDAR MLP-VAE (DreamerV3-style latent compression)
-./run.sh train_sac.py --demos demos/recording.npz --headless --lidar-mlp-vae
-
-# LiDAR MLP-VAE with custom hyperparameters
-./run.sh train_sac.py --demos demos/recording.npz --headless --lidar-mlp-vae \
-  --vae-epochs 200 --vae-beta 0.05 --vae-aux-freq 5
+# Custom CVAE hyperparameters
+./run.sh train_sac.py --demos demos/recording.npz --headless \
+  --cvae-epochs 200 --cvae-beta 0.05 --cvae-z-dim 16
 
 # Resume SAC/TQC training from checkpoint
 ./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
@@ -274,61 +272,99 @@ These collectively save a few ms per step but are minor compared to UTD ratio.
 - **CPU vs GPU physics**: Marginal for single-robot scenes — PhysX auto-selects well
 - **Reducing reset settle steps**: Saves 8 steps per episode (~200ms/reset), negligible over 1M steps
 
-## LiDAR MLP-VAE (`--lidar-mlp-vae`)
+## Chunk CVAE + Q-Chunking
 
-Optional DreamerV3-style feature extractor that compresses 24D LiDAR into a 16D latent via a Gaussian VAE. Enabled with `--lidar-mlp-vae` flag on `train_sac.py`.
+The SAC/TQC pipeline uses action chunking to reduce compounding errors from single-step BC. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking).
 
 ### Architecture
 ```
-34D obs → split → [state 0:10]  → symlog → MLP(10→64→32)  → concat → 48D → actor/critic
-                   [lidar 10:34] → symlog → VAE enc(24→128→64→μ,σ→16D) ↗
-                                                  ↓
-                                    VAE dec(16→64→128→24) → recon+KL loss (auxiliary)
+ChunkedEnvWrapper: action_space (2,) → (k*2,), executes k sub-steps per wrapper step
+  R_chunk = Σ γ^i r_i, effective gamma = γ^k
+
+Actor:  obs(34D) → ChunkCVAEFeatureExtractor → (obs_features || z=0) → latent_pi → mu → tanh → (k*2)
+Critic: Q(obs_features || z=0, action_chunk) → scalar
+
+ChunkCVAEFeatureExtractor:
+  34D obs → split → [state 0:10]  → symlog → MLP(10→64→32)  →  32D ┐
+                     [lidar 10:34] → symlog → MLP(24→128→64)  →  64D ├→ concat → 96D + z_pad(8D) = 104D
+                                                                      └→ z_pad = zeros(z_dim)
+
+CVAE pretraining (replaces BC warmstart):
+  Encoder (train-only): (obs_features, action_chunk) → z
+  Decoder (= actor's latent_pi + mu): (obs_features, z) → action_chunk
+  Loss: L1 reconstruction + β·KL
+  After pretraining: encoder discarded, z fixed to 0
 ```
 
-- **symlog**: `sign(x) * log(|x|+1)` — near-identity for LiDAR [0,1], compresses state magnitudes
-- **Gaussian VAE**: Reparameterization trick; stochastic z during training, deterministic μ during eval
-- **Latent dim**: 16D (1.5× compression of 24D LiDAR), ~30K params total
-
 ### Pipeline Order
-1. Pretrain VAE on demo LiDAR data (`pretrain_lidar_vae()`)
-2. Create model with `LidarVAEFeatureExtractor` as custom feature extractor
-3. Inject LayerNorm into critics (`inject_layernorm_into_critics()`)
-4. Inject pretrained VAE weights into actor/critic/critic_target feature extractors
-5. BC warmstart with `include_feature_extractor=True` (trains state MLP + VAE encoder alongside actor)
-6. Train with `VAEAuxLossCallback` maintaining VAE via auxiliary reconstruction+KL loss
+1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
+2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
+3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-2.0
+4. Inject LayerNorm into critics (`inject_layernorm_into_critics()`)
+5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
+6. Copy pretrained feature extractor weights → critic/critic_target
+7. Train with SAC/TQC (no auxiliary callback needed — CVAE encoder is discarded)
 
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
-- **LidarMLPVAE.create()**: Factory returning MLP-VAE nn.Module (encoder+decoder)
-- **pretrain_lidar_vae()**: Pretrains VAE on demo LiDAR with MSE+βKL loss
-- **LidarVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor subclass
-- **VAEAuxLossCallback.create()**: Returns SB3 callback for auxiliary VAE loss during RL
-- **bc_warmstart_sac()**: `include_feature_extractor` param includes feature extractor in BC optimization
+- **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
+- **pretrain_chunk_cvae()**: CVAE pretraining on demo action chunks; trains feature extractor + actor layers
+
+### Key Functions (`src/demo_utils.py`)
+- **extract_action_chunks()**: Sliding-window action chunks within episode boundaries
+- **make_chunk_transitions()**: Chunk-level (obs, action, R_chunk, next_obs, done) transitions
+
+### Key Classes (`src/jetbot_rl_env.py`)
+- **ChunkedEnvWrapper**: Gymnasium wrapper expanding action space to (k*2,), executing k sub-steps
 
 ### CLI Flags
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--lidar-mlp-vae` | off | Enable VAE feature extractor |
-| `--vae-epochs` | 100 | VAE pretraining epochs |
-| `--vae-beta` | 0.1 | KL divergence weight |
-| `--vae-aux-freq` | 10 | Auxiliary loss frequency (steps) |
-| `--vae-aux-lr` | 1e-4 | Auxiliary loss learning rate |
+| `--chunk-size` | 10 | Action chunk size (k) |
+| `--cvae-z-dim` | 8 | CVAE latent dimension |
+| `--cvae-epochs` | 100 | CVAE pretraining epochs |
+| `--cvae-beta` | 0.1 | CVAE KL weight |
+| `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
 
 ### Compatibility
 - `inject_layernorm_into_critics`: Unaffected — operates on critic nets after feature extraction
-- Replay buffer / demo loading: Unaffected — flat 34D obs stored as-is; feature extractor handles slicing
-- `--resume`: Works — SB3 pickles `features_extractor_class`, loads VAE from state_dict
-- `eval_policy.py`: Imports `train_sac` to register custom classes for model deserialization
+- Replay buffer: Uses chunk-level transitions (obs, k*2 action, R_chunk, next_obs, done)
+- `--resume`: Works — SB3 pickles `features_extractor_class`; chunk_size auto-detected from action_dim
+- `eval_policy.py`: Auto-detects chunk_size from model action space, wraps eval env with ChunkedEnvWrapper
 
 ## Testing
 
 Tests use pytest with mocked Isaac Sim imports:
 ```bash
-./run_tests.sh           # All tests
+./run_tests.bat          # All tests (Windows)
+./run_tests.sh           # All tests (Linux)
 ./run_tests.sh -v        # Verbose
 ./run_tests.sh -k name   # Specific test
 ```
+
+### Mocking gymnasium.Env Subclasses
+
+`gymnasium.Wrapper.__init__` performs a hard `isinstance(env, Env)` assertion. Plain `Mock()` objects fail this check. Any test helper that creates a fake env for use with `ChunkedEnvWrapper` (or any other `gymnasium.Wrapper` subclass) **must** return a real `gymnasium.Env` subclass, not a `Mock`.
+
+**Wrong — fails at wrapper construction:**
+```python
+env = Mock()
+env.observation_space = gym.spaces.Box(...)
+env.action_space = gym.spaces.Box(...)
+```
+
+**Correct — define a minimal concrete subclass:**
+```python
+class _MinimalEnv(gym.Env):
+    def __init__(self):
+        super().__init__()
+        self.observation_space = gym.spaces.Box(...)
+        self.action_space = gym.spaces.Box(...)
+    def reset(self, **kwargs): return np.zeros(...), {}
+    def step(self, action): return np.zeros(...), 0.0, False, False, {}
+```
+
+Per-test behaviour can still be customised by overriding the instance's `step` attribute after construction (e.g. `inner.step = mock_step`).
 
 ## Reward Function
 
