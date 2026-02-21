@@ -1054,6 +1054,7 @@ class RewardComputer:
     COLLISION_PENALTY = -10.0
     PROXIMITY_SCALE = 0.1
     PROXIMITY_THRESHOLD = 0.3  # meters
+    PROXIMITY_GATE_DIST = 0.5  # meters — full penalty beyond this distance
     TIME_PENALTY = -0.005
     ROBOT_RADIUS = 0.08  # Jetbot effective radius
 
@@ -1116,10 +1117,12 @@ class RewardComputer:
         reward += heading_bonus * self.HEADING_BONUS_SCALE
 
         # Proximity penalty (smooth, increases as robot nears obstacle)
+        # Gated by goal distance: full penalty far from goal, zero at goal
         min_lidar = info.get('min_lidar_distance', float('inf'))
         if min_lidar < self.PROXIMITY_THRESHOLD:
+            gate = min(curr_dist / self.PROXIMITY_GATE_DIST, 1.0)
             proximity_penalty = self.PROXIMITY_SCALE * (1.0 - min_lidar / self.PROXIMITY_THRESHOLD)
-            reward -= proximity_penalty
+            reward -= gate * proximity_penalty
 
         # Small time penalty to encourage efficiency
         reward += self.TIME_PENALTY

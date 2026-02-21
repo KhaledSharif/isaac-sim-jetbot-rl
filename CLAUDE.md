@@ -378,7 +378,7 @@ Per-test behaviour can still be customised by overriding the instance's `step` a
 - **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
 - **Distance shaping**: `(prev_dist - curr_dist) * 1.0`
 - **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1`
-- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m
+- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m, gated by goal distance (linearly reduced within 0.5m of goal, zero at goal)
 - **Time penalty**: -0.005 per step
 
 ### Sparse Mode

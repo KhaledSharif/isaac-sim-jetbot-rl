@@ -405,6 +405,54 @@ class TestRewardComputer:
         # Only difference should be time penalty (present in both)
         assert abs(reward_no_lidar - reward_far_lidar) < 0.001
 
+    def test_reward_computer_proximity_penalty_gated_near_goal(self):
+        """Test proximity penalty is reduced when robot is close to goal."""
+        from jetbot_keyboard_control import RewardComputer
+        computer = RewardComputer(mode='dense')
+
+        # Robot far from goal (gate = 1.0, full penalty)
+        prev_far = np.zeros(10)
+        prev_far[7] = 2.0
+        next_far = np.zeros(10)
+        next_far[7] = 2.0
+        next_far[8] = 0.0
+
+        reward_far_goal = computer.compute(
+            obs=prev_far, action=np.zeros(2), next_obs=next_far,
+            info={'goal_reached': False, 'min_lidar_distance': 0.1}
+        )
+
+        # Robot near goal (gate < 1.0, reduced penalty)
+        prev_near = np.zeros(10)
+        prev_near[7] = 0.25
+        next_near = np.zeros(10)
+        next_near[7] = 0.25
+        next_near[8] = 0.0
+
+        reward_near_goal = computer.compute(
+            obs=prev_near, action=np.zeros(2), next_obs=next_near,
+            info={'goal_reached': False, 'min_lidar_distance': 0.1}
+        )
+
+        # Robot at goal (gate = 0.0, no penalty)
+        prev_at = np.zeros(10)
+        prev_at[7] = 0.0
+        next_at = np.zeros(10)
+        next_at[7] = 0.0
+        next_at[8] = 0.0
+
+        reward_at_goal = computer.compute(
+            obs=prev_at, action=np.zeros(2), next_obs=next_at,
+            info={'goal_reached': False, 'min_lidar_distance': 0.1}
+        )
+
+        # Near goal should get less penalty than far from goal
+        assert reward_near_goal > reward_far_goal, \
+            "Proximity penalty should be reduced near goal"
+        # At goal should get even less penalty
+        assert reward_at_goal > reward_near_goal, \
+            "Proximity penalty should be zero at goal"
+
 
 # ============================================================================
 # TEST SUITE: LidarSensor
