@@ -720,6 +720,7 @@ class DemoRecorder:
         self.actions = []
         self.rewards = []
         self.dones = []
+        self.costs = []
 
         # Episode tracking
         self.episode_starts = []
@@ -745,7 +746,7 @@ class DemoRecorder:
         self.is_recording = False
 
     def record_step(self, obs: np.ndarray, action: np.ndarray,
-                    reward: float, done: bool) -> None:
+                    reward: float, done: bool, cost: float = 0.0) -> None:
         """Record a single timestep.
 
         Args:
@@ -753,6 +754,7 @@ class DemoRecorder:
             action: Action vector
             reward: Reward value
             done: Whether episode is done
+            cost: Constraint cost value (for SafeTQC)
         """
         if not self.is_recording:
             return
@@ -761,6 +763,7 @@ class DemoRecorder:
         self.actions.append(action.copy())
         self.rewards.append(reward)
         self.dones.append(done)
+        self.costs.append(cost)
         self.current_episode_return += reward
 
     def mark_episode_success(self, success: bool) -> None:
@@ -800,6 +803,7 @@ class DemoRecorder:
         self.actions = self.actions[:self.current_episode_start]
         self.rewards = self.rewards[:self.current_episode_start]
         self.dones = self.dones[:self.current_episode_start]
+        self.costs = self.costs[:self.current_episode_start]
         self.current_episode_return = 0.0
         self._pending_success = None
 
@@ -828,6 +832,7 @@ class DemoRecorder:
         self.actions = []
         self.rewards = []
         self.dones = []
+        self.costs = []
         self.episode_starts = []
         self.episode_lengths = []
         self.episode_returns = []
@@ -873,12 +878,17 @@ class DemoRecorder:
             obs_array = np.array([]).reshape(0, self.obs_dim)
             action_array = np.array([]).reshape(0, self.action_dim)
 
+        # Add cost metadata if costs were recorded
+        if self.costs:
+            save_metadata['has_cost'] = True
+
         np.savez_compressed(
             filepath,
             observations=obs_array,
             actions=action_array,
             rewards=np.array(self.rewards, dtype=np.float32),
             dones=np.array(self.dones, dtype=bool),
+            costs=np.array(self.costs, dtype=np.float32) if self.costs else np.array([], dtype=np.float32),
             episode_starts=np.array(self.episode_starts, dtype=np.int64),
             episode_lengths=np.array(self.episode_lengths, dtype=np.int64),
             episode_returns=np.array(self.episode_returns, dtype=np.float32),
@@ -908,6 +918,7 @@ class DemoRecorder:
         recorder.actions = list(data['actions'])
         recorder.rewards = list(data['rewards'])
         recorder.dones = list(data['dones'])
+        recorder.costs = list(data['costs']) if 'costs' in data else []
         recorder.episode_starts = list(data['episode_starts'])
         recorder.episode_lengths = list(data['episode_lengths'])
         recorder.episode_returns = list(data['episode_returns'])
@@ -1058,13 +1069,15 @@ class RewardComputer:
     TIME_PENALTY = -0.005
     ROBOT_RADIUS = 0.08  # Jetbot effective radius
 
-    def __init__(self, mode: str = 'dense'):
+    def __init__(self, mode: str = 'dense', safe_mode: bool = False):
         """Initialize the RewardComputer.
 
         Args:
             mode: 'dense' for shaped rewards, 'sparse' for only goal completion
+            safe_mode: If True, skip proximity penalty (handled by cost critic)
         """
         self.mode = mode
+        self.safe_mode = safe_mode
 
     def compute(self, obs: np.ndarray, action: np.ndarray,
                 next_obs: np.ndarray, info: dict) -> float:
@@ -1118,16 +1131,38 @@ class RewardComputer:
 
         # Proximity penalty (smooth, increases as robot nears obstacle)
         # Gated by goal distance: full penalty far from goal, zero at goal
-        min_lidar = info.get('min_lidar_distance', float('inf'))
-        if min_lidar < self.PROXIMITY_THRESHOLD:
-            gate = min(curr_dist / self.PROXIMITY_GATE_DIST, 1.0)
-            proximity_penalty = self.PROXIMITY_SCALE * (1.0 - min_lidar / self.PROXIMITY_THRESHOLD)
-            reward -= gate * proximity_penalty
+        # Skipped in safe_mode (handled by cost critic instead)
+        if not self.safe_mode:
+            min_lidar = info.get('min_lidar_distance', float('inf'))
+            if min_lidar < self.PROXIMITY_THRESHOLD:
+                gate = min(curr_dist / self.PROXIMITY_GATE_DIST, 1.0)
+                proximity_penalty = self.PROXIMITY_SCALE * (1.0 - min_lidar / self.PROXIMITY_THRESHOLD)
+                reward -= gate * proximity_penalty
 
         # Small time penalty to encourage efficiency
         reward += self.TIME_PENALTY
 
         return reward
+
+    @staticmethod
+    def compute_cost(info: dict, cost_type: str = 'proximity') -> float:
+        """Compute constraint cost for SafeTQC.
+
+        Args:
+            info: Info dict with 'min_lidar_distance' and 'collision' keys
+            cost_type: 'proximity', 'collision', or 'both'
+
+        Returns:
+            Cost value (0.0 or 1.0)
+        """
+        proximity = 1.0 if info.get('min_lidar_distance', float('inf')) < 0.3 else 0.0
+        collision = 1.0 if info.get('collision', False) else 0.0
+        if cost_type == 'proximity':
+            return proximity
+        elif cost_type == 'collision':
+            return collision
+        else:  # 'both'
+            return max(proximity, collision)
 
 
 class OccupancyGrid:
@@ -2086,9 +2121,12 @@ class JetbotKeyboardController:
                 self.current_obs, action, next_obs, info
             )
 
+        # Compute cost for SafeTQC
+        cost = RewardComputer.compute_cost(info)
+
         # done = true MDP terminal only (goal/collision/OOB); timeout is truncation
         done = goal_reached or collision or self._is_out_of_bounds(position)
-        self.recorder.record_step(self.current_obs, action, reward, done)
+        self.recorder.record_step(self.current_obs, action, reward, done, cost=cost)
 
         # Update state
         self.current_obs = next_obs

@@ -57,9 +57,13 @@ from train_sac import (
     symlog,
     ChunkCVAEFeatureExtractor,
     pretrain_chunk_cvae,
+    CostReplayBuffer,
+    MeanCostCritic,
+    _create_safe_tqc_class,
 )
 from demo_utils import extract_action_chunks, make_chunk_transitions
 from jetbot_rl_env import ChunkedEnvWrapper
+from jetbot_keyboard_control import RewardComputer
 
 
 # ============================================================================
@@ -67,7 +71,7 @@ from jetbot_rl_env import ChunkedEnvWrapper
 # ============================================================================
 
 def make_demo_npz(path, num_episodes=20, steps_per_ep=50, obs_dim=34,
-                  success_rate=0.5):
+                  success_rate=0.5, include_costs=False):
     """Create a synthetic demo NPZ file for testing."""
     total = num_episodes * steps_per_ep
     obs = np.random.randn(total, obs_dim).astype(np.float32)
@@ -82,9 +86,17 @@ def make_demo_npz(path, num_episodes=20, steps_per_ep=50, obs_dim=34,
     for length in episode_lengths:
         dones[offset + length - 1] = 1.0
         offset += length
-    np.savez(path,
-             observations=obs, actions=actions, rewards=rewards, dones=dones,
-             episode_lengths=episode_lengths, episode_success=episode_success)
+    save_kwargs = dict(
+        observations=obs, actions=actions, rewards=rewards, dones=dones,
+        episode_lengths=episode_lengths, episode_success=episode_success,
+    )
+    if include_costs:
+        costs = np.random.rand(total).astype(np.float32)
+        metadata = {'obs_dim': obs_dim, 'action_dim': 2, 'has_cost': True,
+                     'num_episodes': num_episodes, 'total_frames': total}
+        save_kwargs['costs'] = costs
+        save_kwargs['metadata'] = np.array(metadata, dtype=object)
+    np.savez(path, **save_kwargs)
     return path
 
 
@@ -770,3 +782,318 @@ class TestMakeChunkTransitions:
         assert c_dones[-1] == 1.0
         # First chunk (steps 0,1,2) should not be terminal
         assert c_dones[0] == 0.0
+
+
+# ============================================================================
+# TEST SUITE: RewardComputer.compute_cost
+# ============================================================================
+
+class TestRewardComputerCost:
+    def test_proximity_cost_triggered(self):
+        """proximity cost = 1.0 when min_lidar_distance < 0.3."""
+        info = {'min_lidar_distance': 0.2, 'collision': False}
+        assert RewardComputer.compute_cost(info, cost_type='proximity') == 1.0
+
+    def test_proximity_cost_safe(self):
+        """proximity cost = 0.0 when min_lidar_distance >= 0.3."""
+        info = {'min_lidar_distance': 0.5, 'collision': False}
+        assert RewardComputer.compute_cost(info, cost_type='proximity') == 0.0
+
+    def test_collision_cost_triggered(self):
+        """collision cost = 1.0 when collision is True."""
+        info = {'min_lidar_distance': 0.05, 'collision': True}
+        assert RewardComputer.compute_cost(info, cost_type='collision') == 1.0
+
+    def test_collision_cost_safe(self):
+        """collision cost = 0.0 when collision is False."""
+        info = {'min_lidar_distance': 0.2, 'collision': False}
+        assert RewardComputer.compute_cost(info, cost_type='collision') == 0.0
+
+    def test_both_cost_type(self):
+        """both = max(proximity, collision)."""
+        info = {'min_lidar_distance': 0.2, 'collision': False}
+        assert RewardComputer.compute_cost(info, cost_type='both') == 1.0
+        info2 = {'min_lidar_distance': 0.5, 'collision': True}
+        assert RewardComputer.compute_cost(info2, cost_type='both') == 1.0
+        info3 = {'min_lidar_distance': 0.5, 'collision': False}
+        assert RewardComputer.compute_cost(info3, cost_type='both') == 0.0
+
+    def test_safe_mode_skips_proximity_penalty(self):
+        """safe_mode=True suppresses proximity penalty in dense reward."""
+        rc = RewardComputer(mode='dense', safe_mode=True)
+        obs = np.zeros(10)
+        obs[7] = 1.0  # distance to goal
+        next_obs = np.zeros(10)
+        next_obs[7] = 0.95
+        next_obs[8] = 0.1
+        info = {'min_lidar_distance': 0.15, 'collision': False, 'goal_reached': False}
+        reward_safe = rc.compute(obs, np.zeros(2), next_obs, info)
+
+        rc_normal = RewardComputer(mode='dense', safe_mode=False)
+        reward_normal = rc_normal.compute(obs, np.zeros(2), next_obs, info)
+
+        # safe_mode should give higher reward (no proximity penalty subtracted)
+        assert reward_safe > reward_normal
+
+
+# ============================================================================
+# TEST SUITE: ValidateDemoData with cost requirement
+# ============================================================================
+
+class TestValidateDemoDataCost:
+    def test_require_cost_passes_with_cost_data(self, tmp_path):
+        path = tmp_path / "demo.npz"
+        make_demo_npz(path, num_episodes=20, steps_per_ep=50,
+                      success_rate=0.5, include_costs=True)
+        result = validate_demo_data(str(path), require_cost=True)
+        assert result['episodes'] == 20
+
+    def test_require_cost_fails_without_cost_data(self, tmp_path):
+        path = tmp_path / "demo.npz"
+        make_demo_npz(path, num_episodes=20, steps_per_ep=50, success_rate=0.5)
+        with pytest.raises(ValueError, match="missing cost data"):
+            validate_demo_data(str(path), require_cost=True)
+
+    def test_no_require_cost_passes_without_cost_data(self, tmp_path):
+        """When require_cost=False, missing cost data is fine."""
+        path = tmp_path / "demo.npz"
+        make_demo_npz(path, num_episodes=20, steps_per_ep=50, success_rate=0.5)
+        result = validate_demo_data(str(path), require_cost=False)
+        assert result['episodes'] == 20
+
+
+# ============================================================================
+# TEST SUITE: LoadDemoTransitions with costs
+# ============================================================================
+
+class TestLoadDemoTransitionsCosts:
+    def test_load_costs_returns_6_tuple(self, tmp_path):
+        path = tmp_path / "demo.npz"
+        make_demo_npz(path, num_episodes=5, steps_per_ep=20, include_costs=True)
+        result = load_demo_transitions(str(path), load_costs=True)
+        assert len(result) == 6
+        obs, actions, rewards, next_obs, dones, costs = result
+        assert costs.shape == (100,)
+        assert costs.dtype == np.float32
+
+    def test_load_costs_false_returns_5_tuple(self, tmp_path):
+        path = tmp_path / "demo.npz"
+        make_demo_npz(path, num_episodes=5, steps_per_ep=20, include_costs=True)
+        result = load_demo_transitions(str(path), load_costs=False)
+        assert len(result) == 5
+
+    def test_load_costs_fallback_zeros(self, tmp_path):
+        """Missing costs key -> zeros array."""
+        path = tmp_path / "demo.npz"
+        make_demo_npz(path, num_episodes=5, steps_per_ep=20, include_costs=False)
+        result = load_demo_transitions(str(path), load_costs=True)
+        assert len(result) == 6
+        costs = result[5]
+        assert np.all(costs == 0.0)
+
+
+# ============================================================================
+# TEST SUITE: MakeChunkTransitions with costs
+# ============================================================================
+
+class TestMakeChunkTransitionsCosts:
+    def test_chunk_cost_accumulation(self):
+        """Chunk cost matches hand-computed sum(gamma^i * c_i)."""
+        total = 10
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        rewards = np.ones(total, dtype=np.float32)
+        dones = np.zeros(total, dtype=np.float32)
+        dones[9] = 1.0
+        costs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                         dtype=np.float32)
+        ep_lengths = np.array([10])
+        gamma = 0.9
+        k = 3
+
+        result = make_chunk_transitions(
+            obs, actions, rewards, dones, ep_lengths, k, gamma, demo_costs=costs)
+        assert len(result) == 6
+        c_obs, c_acts, c_rews, c_next, c_dones, c_costs = result
+
+        # First chunk (steps 0,1,2): c0 + 0.9*c1 + 0.81*c2 = 1.0 + 0 + 0.81 = 1.81
+        expected = 1.0 + 0.9 * 0.0 + 0.81 * 1.0
+        assert abs(c_costs[0] - expected) < 1e-6
+
+    def test_no_costs_returns_5_tuple(self):
+        """Without demo_costs, returns 5-tuple."""
+        total = 10
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        rewards = np.ones(total, dtype=np.float32)
+        dones = np.zeros(total, dtype=np.float32)
+        dones[9] = 1.0
+        ep_lengths = np.array([10])
+
+        result = make_chunk_transitions(
+            obs, actions, rewards, dones, ep_lengths, 3, 0.9)
+        assert len(result) == 5
+
+
+# ============================================================================
+# TEST SUITE: ChunkedEnvWrapper cost accumulation
+# ============================================================================
+
+class TestChunkedEnvWrapperCost:
+    def _make_mock_env(self, obs_dim=34, act_dim=2):
+        import gymnasium as gym
+
+        class _MinimalEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
+
+            def reset(self, **kwargs):
+                return np.zeros(obs_dim, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(obs_dim, dtype=np.float32), 0.0, False, False, {'cost': 0.0}
+
+        return _MinimalEnv()
+
+    def test_cost_chunk_accumulated(self):
+        """c_chunk = sum(gamma^i * cost_i) across sub-steps."""
+        inner = self._make_mock_env()
+        k = 3
+        gamma = 0.9
+        costs = [1.0, 0.0, 1.0]
+        obs = np.zeros(34, dtype=np.float32)
+
+        call_count = [0]
+        def mock_step(action):
+            c = costs[call_count[0]]
+            call_count[0] += 1
+            return obs, 1.0, False, False, {'cost': c}
+
+        inner.step = mock_step
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=k, gamma=gamma)
+
+        action_flat = np.zeros(k * 2, dtype=np.float32)
+        _, _, _, _, info = wrapper.step(action_flat)
+
+        expected_cost = 1.0 + 0.9 * 0.0 + 0.81 * 1.0
+        assert abs(info['cost_chunk'] - expected_cost) < 1e-6
+
+    def test_cost_chunk_on_early_termination(self):
+        """Early termination -> partial cost chunk."""
+        inner = self._make_mock_env()
+        k = 5
+        obs = np.zeros(34, dtype=np.float32)
+
+        call_count = [0]
+        def mock_step(action):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                return obs, 10.0, True, False, {'cost': 1.0}
+            return obs, 1.0, False, False, {'cost': 0.5}
+
+        inner.step = mock_step
+        wrapper = ChunkedEnvWrapper(inner, chunk_size=k, gamma=0.99)
+
+        action_flat = np.zeros(k * 2, dtype=np.float32)
+        _, _, terminated, _, info = wrapper.step(action_flat)
+
+        assert terminated is True
+        expected_cost = 0.5 + 0.99 * 1.0
+        assert abs(info['cost_chunk'] - expected_cost) < 1e-6
+
+
+# ============================================================================
+# TEST SUITE: CostReplayBuffer
+# ============================================================================
+
+class TestCostReplayBuffer:
+    def test_add_and_sample(self):
+        """Basic add/sample cycle works."""
+        import torch
+        device = torch.device('cpu')
+        demo_costs = np.array([0.5, 1.0, 0.0, 0.5], dtype=np.float32)
+        buf = CostReplayBuffer(100, device, demo_costs=demo_costs)
+
+        # Add some online costs
+        for c in [0.1, 0.2, 0.3]:
+            buf.add(c)
+
+        # Sample demo indices
+        demo_idx = np.array([0, 2])
+        online_idx = np.array([0, 1])
+        result = buf.sample(demo_idx, online_idx)
+
+        assert result.shape == (4, 1)
+        # Demo costs: [0.5, 0.0], online costs: [0.1, 0.2]
+        assert abs(result[0].item() - 0.5) < 1e-6
+        assert abs(result[1].item() - 0.0) < 1e-6
+        assert abs(result[2].item() - 0.1) < 1e-6
+        assert abs(result[3].item() - 0.2) < 1e-6
+
+    def test_demo_only_sample(self):
+        """Sample with online_indices=None returns only demo costs."""
+        import torch
+        device = torch.device('cpu')
+        demo_costs = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        buf = CostReplayBuffer(100, device, demo_costs=demo_costs)
+
+        demo_idx = np.array([0, 1, 2])
+        result = buf.sample(demo_idx, None)
+        assert result.shape == (3, 1)
+
+
+# ============================================================================
+# TEST SUITE: MeanCostCritic
+# ============================================================================
+
+class TestMeanCostCritic:
+    def test_output_shape(self):
+        """Cost critic produces list of n_critics tensors, each (batch, 1)."""
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+        obs_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=8)
+        features_dim = 104
+        action_dim = 20  # chunk_size=10 * act_dim=2
+
+        device = torch.device('cpu')
+        critic, critic_target = MeanCostCritic.create(
+            n_critics=2, features_dim=features_dim, action_dim=action_dim,
+            fe_class=fe_cls, fe_kwargs=dict(features_dim=features_dim),
+            obs_space=obs_space, device=device
+        )
+
+        obs = torch.randn(8, 34)
+        actions = torch.randn(8, 20)
+        outputs = critic(obs, actions)
+        assert len(outputs) == 2
+        assert outputs[0].shape == (8, 1)
+        assert outputs[1].shape == (8, 1)
+
+    def test_target_matches_initial(self):
+        """critic_target should have same weights as critic initially."""
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+        obs_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=8)
+
+        device = torch.device('cpu')
+        critic, critic_target = MeanCostCritic.create(
+            n_critics=2, features_dim=104, action_dim=20,
+            fe_class=fe_cls, fe_kwargs=dict(features_dim=104),
+            obs_space=obs_space, device=device
+        )
+
+        for key in critic.state_dict():
+            torch.testing.assert_close(
+                critic.state_dict()[key],
+                critic_target.state_dict()[key],
+            )

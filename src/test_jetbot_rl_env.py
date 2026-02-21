@@ -655,6 +655,8 @@ class TestStep:
             env.workspace_bounds = {'x': [-2.0, 2.0], 'y': [-2.0, 2.0]}
             env.headless = True
             env.goal_threshold = 0.15
+            env.cost_type = 'proximity'
+            env.safe_mode = False
             env.lidar_sensor = LidarSensor(num_rays=24, fov_deg=180.0, max_range=3.0)
             env.obs_builder = ObservationBuilder(lidar_sensor=env.lidar_sensor)
             env.reward_computer = RewardComputer(mode='dense')

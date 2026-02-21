@@ -103,6 +103,8 @@ class JetbotNavigationEnv(gymnasium.Env):
         num_obstacles: int = 5,
         min_goal_dist: float = 0.5,
         inflation_radius: float = 0.08,
+        cost_type: str = 'proximity',
+        safe_mode: bool = False,
     ):
         """Initialize the Jetbot navigation environment.
 
@@ -129,6 +131,8 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.num_obstacles = num_obstacles
         self.min_goal_dist = min_goal_dist
         self.inflation_radius = inflation_radius
+        self.cost_type = cost_type
+        self.safe_mode = safe_mode
 
         # Create LiDAR sensor
         self.lidar_sensor = LidarSensor(
@@ -158,7 +162,7 @@ class JetbotNavigationEnv(gymnasium.Env):
 
         # Initialize helper components
         self.obs_builder = ObservationBuilder(lidar_sensor=self.lidar_sensor)
-        self.reward_computer = RewardComputer(mode=reward_mode)
+        self.reward_computer = RewardComputer(mode=reward_mode, safe_mode=safe_mode)
         self.scene_manager = SceneManager(
             self.world,
             workspace_bounds=self.workspace_bounds,
@@ -410,6 +414,9 @@ class JetbotNavigationEnv(gymnasium.Env):
             'min_lidar_distance': min_lidar,
         }
 
+        # Compute constraint cost for SafeTQC
+        info['cost'] = RewardComputer.compute_cost(info, cost_type=self.cost_type)
+
         # Compute reward
         reward = self.reward_computer.compute(self._prev_obs, action, next_obs, info)
 
@@ -542,6 +549,7 @@ class ChunkedEnvWrapper(gymnasium.Wrapper):
         actions = action_flat.reshape(self.chunk_size, -1)
 
         r_chunk = 0.0
+        c_chunk = 0.0
         terminated = False
         truncated = False
         obs = None
@@ -550,7 +558,9 @@ class ChunkedEnvWrapper(gymnasium.Wrapper):
         for i, act in enumerate(actions):
             obs, reward, terminated, truncated, info = self.env.step(act)
             r_chunk += (self.gamma ** i) * reward
+            c_chunk += (self.gamma ** i) * info.get('cost', 0.0)
             if terminated or truncated:
                 break
 
+        info['cost_chunk'] = c_chunk
         return obs, r_chunk, terminated, truncated, info

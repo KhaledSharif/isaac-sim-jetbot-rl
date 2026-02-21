@@ -11,6 +11,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Demonstration Recording**: Record navigation trajectories for imitation learning
 - **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
 - **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with Chunk CVAE + Q-Chunking
+- **SafeTQC**: Constrained RL with dual cost critic + learned Lagrange multiplier for obstacle avoidance
 - **Action Chunking**: k-step action chunks reduce compounding errors from single-step BC
 - **Chunk CVAE**: Conditional VAE pretraining handles multimodal demonstrations
 - **Q-Chunking**: Critic evaluates chunk-level Q-values via `ChunkedEnvWrapper`
@@ -69,6 +70,9 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 
 ```bash
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
+
+# With SafeTQC (constrained RL)
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe
 ```
 
 ## Controls
@@ -185,6 +189,16 @@ isaac-sim-jetbot-keyboard/
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
   --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
 
+# SafeTQC: constrained RL with cost critic + Lagrange multiplier
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe
+
+# SafeTQC with custom cost limit and cost type
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe \
+  --cost-limit 10.0 --cost-type both
+
+# SafeTQC keeping proximity penalty in reward (default: auto-removed)
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe --keep-proximity-reward
+
 # PPO with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
@@ -228,6 +242,29 @@ ChunkCVAEFeatureExtractor:
 | `--utd-ratio` | 20 | Gradient steps per env step |
 | `--demo-ratio` | 0.5 | Fraction of batch from demos |
 
+#### SafeTQC: Constrained RL with Lagrange Multiplier
+
+When `--safe` is enabled, `train_sac.py` adds a **cost critic** and **learned Lagrange multiplier** on top of the standard TQC pipeline. This replaces the hand-tuned proximity penalty in the reward function with a principled constrained optimization approach.
+
+**How it works:**
+- A separate cost critic estimates cumulative obstacle violation costs (binary: 1.0 if min LiDAR < 0.3m, else 0.0)
+- The actor loss becomes: `ent_coef * log_prob - Q_reward + λ * Q_cost`
+- The Lagrange multiplier λ is learned to satisfy a per-episode cost budget
+- The proximity penalty is automatically removed from the reward (override with `--keep-proximity-reward`)
+
+**Requirements:** Demos must be recorded with cost data (`has_cost` metadata). Any demos recorded after this feature was added will include costs automatically.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--safe` | off | Enable SafeTQC |
+| `--cost-limit` | 25.0 | Per-episode cost budget |
+| `--lagrange-lr` | 3e-4 | Lagrange multiplier learning rate |
+| `--lagrange-init` | 0.0 | Initial log-lambda |
+| `--cost-n-critics` | 2 | Number of cost critic networks |
+| `--cost-critic-type` | mean | `mean` (MSE) or `quantile` |
+| `--cost-type` | proximity | `proximity`, `collision`, or `both` |
+| `--keep-proximity-reward` | off | Keep proximity penalty with `--safe` |
+
 #### PPO + BC Warmstart Pipeline
 
 When `--bc-warmstart` is provided, the training script runs:
@@ -248,6 +285,9 @@ The VecNormalize pre-warming step is critical: without it, the BC-learned policy
 
 # Headless evaluation
 ./run.sh eval_policy.py models/tqc_jetbot.zip --headless --episodes 100
+
+# Evaluation with cost tracking (for SafeTQC models)
+./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100 --safe --cost-type proximity
 
 # Override chunk size or inflation radius
 ./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
@@ -313,7 +353,7 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 - **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
 - **Distance shaping**: `(prev_dist - curr_dist) * 1.0` — reward for getting closer
 - **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1` — reward for facing goal
-- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when near obstacles
+- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when near obstacles (auto-removed with `--safe`, handled by cost critic instead)
 - **Time penalty**: -0.005 per step
 
 ### Sparse Mode
@@ -358,7 +398,10 @@ Additional optimizations applied in headless mode:
 - **ChunkCVAEFeatureExtractor**: Split state/lidar MLPs + z-pad slot for CVAE latent variable
 - **DifferentialController**: Converts velocity commands to wheel speeds
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
-- **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations
+- **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations (with cost data for SafeTQC)
+- **SafeTQC**: TQC subclass with cost critic + Lagrange multiplier for constrained RL
+- **CostReplayBuffer**: Parallel cost buffer mirroring the main replay buffer
+- **MeanCostCritic**: Twin-Q cost critic with independent feature extractor
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
 

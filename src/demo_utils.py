@@ -6,11 +6,12 @@ Used by train_rl.py, train_sac.py, and train_bc.py to avoid duplication.
 import numpy as np
 
 
-def validate_demo_data(filepath: str) -> dict:
+def validate_demo_data(filepath: str, require_cost: bool = False) -> dict:
     """Validate demonstration data meets minimum requirements for training.
 
     Args:
         filepath: Path to .npz demo file
+        require_cost: If True, require cost data (has_cost metadata + costs array)
 
     Returns:
         dict with keys: episodes, transitions, successful, avg_return
@@ -69,6 +70,15 @@ def validate_demo_data(filepath: str) -> dict:
             f"Need >= 3 successful episodes, got {num_successful}. Record more successful demos."
         )
 
+    if require_cost:
+        metadata = data['metadata'].item() if 'metadata' in data else {}
+        has_cost = metadata.get('has_cost', False) if isinstance(metadata, dict) else False
+        if not has_cost or 'costs' not in data:
+            raise ValueError(
+                "Demo file missing cost data (required for --safe). "
+                "Re-record demos with a version that records costs."
+            )
+
     print("  Validation: PASSED\n")
     return summary
 
@@ -111,7 +121,7 @@ def load_demo_data(filepath: str, successful_only: bool = False):
     return observations.astype(np.float32), actions.astype(np.float32)
 
 
-def load_demo_transitions(npz_path: str):
+def load_demo_transitions(npz_path: str, load_costs: bool = False):
     """Load demo data and reconstruct (obs, action, reward, next_obs, done) tuples.
 
     Uses the recorded ``dones`` from the NPZ file, which mark true MDP terminals
@@ -124,9 +134,11 @@ def load_demo_transitions(npz_path: str):
 
     Args:
         npz_path: Path to .npz demo file
+        load_costs: If True, also return costs array (6-tuple)
 
     Returns:
-        Tuple of (obs, actions, rewards, next_obs, dones) numpy arrays
+        5-tuple of (obs, actions, rewards, next_obs, dones) numpy arrays, or
+        6-tuple adding costs when load_costs=True
     """
     data = np.load(npz_path, allow_pickle=True)
     observations = data['observations'].astype(np.float32)
@@ -157,6 +169,9 @@ def load_demo_transitions(npz_path: str):
         offset += length
 
     print(f"Loaded {len(episode_lengths)} demo episodes, {total} transitions")
+    if load_costs:
+        costs = data['costs'].astype(np.float32) if 'costs' in data else np.zeros(total, dtype=np.float32)
+        return observations, actions, rewards, next_obs, dones, costs
     return observations, actions, rewards, next_obs, dones
 
 
@@ -197,7 +212,7 @@ def extract_action_chunks(demo_obs, demo_actions, episode_lengths, chunk_size):
 
 
 def make_chunk_transitions(demo_obs, demo_actions, demo_rewards, demo_dones,
-                           episode_lengths, chunk_size, gamma):
+                           episode_lengths, chunk_size, gamma, demo_costs=None):
     """Build chunk-level (obs, action, reward, next_obs, done) transitions.
 
     Uses a sliding window within each episode. For terminal chunks where the
@@ -212,14 +227,18 @@ def make_chunk_transitions(demo_obs, demo_actions, demo_rewards, demo_dones,
         episode_lengths: numpy array of per-episode step counts
         chunk_size: number of actions per chunk (k)
         gamma: discount factor for computing R_chunk
+        demo_costs: optional numpy array of costs (N,). When provided, also
+            returns chunk-level discounted costs.
 
     Returns:
-        Tuple of (chunk_obs, chunk_actions, chunk_rewards, chunk_next_obs, chunk_dones)
+        5-tuple of (chunk_obs, chunk_actions, chunk_rewards, chunk_next_obs, chunk_dones),
+        or 6-tuple adding chunk_costs when demo_costs is provided
     """
     act_dim = demo_actions.shape[1]
     obs_dim = demo_obs.shape[1]
 
     c_obs, c_acts, c_rews, c_next, c_dones = [], [], [], [], []
+    c_costs = [] if demo_costs is not None else None
 
     offset = 0
     for ep_idx, length in enumerate(episode_lengths):
@@ -237,16 +256,21 @@ def make_chunk_transitions(demo_obs, demo_actions, demo_rewards, demo_dones,
             # Action chunk (full k steps)
             c_acts.append(demo_actions[abs_t:abs_t + chunk_size].reshape(-1))
 
-            # Discounted reward sum and terminal check
+            # Discounted reward sum, cost sum, and terminal check
             r_chunk = 0.0
+            cost_chunk = 0.0
             done_any = False
             for i in range(chunk_size):
                 r_chunk += (gamma ** i) * demo_rewards[abs_t + i]
+                if demo_costs is not None:
+                    cost_chunk += (gamma ** i) * demo_costs[abs_t + i]
                 if demo_dones[abs_t + i]:
                     done_any = True
 
             c_rews.append(r_chunk)
             c_dones.append(float(done_any))
+            if c_costs is not None:
+                c_costs.append(cost_chunk)
 
             # Next obs = observation after the full chunk
             next_idx = abs_t + chunk_size
@@ -258,13 +282,16 @@ def make_chunk_transitions(demo_obs, demo_actions, demo_rewards, demo_dones,
 
         offset += length
 
-    return (
+    result = (
         np.array(c_obs, dtype=np.float32),
         np.array(c_acts, dtype=np.float32),
         np.array(c_rews, dtype=np.float32),
         np.array(c_next, dtype=np.float32),
         np.array(c_dones, dtype=np.float32),
     )
+    if c_costs is not None:
+        return result + (np.array(c_costs, dtype=np.float32),)
+    return result
 
 
 class VerboseEpisodeCallback:

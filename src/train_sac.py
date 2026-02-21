@@ -266,11 +266,19 @@ def make_demo_replay_buffer(buffer_cls, buffer_size, observation_space, action_s
                 rewards=self.demo_rewards[demo_idx],
             )
 
+            # Expose sampled indices for CostReplayBuffer
+            self._last_demo_indices = demo_idx
+
             if online_batch_size == 0:
+                self._last_online_indices = None
                 return demo_samples
 
-            # Sample from online buffer
-            online_samples = super().sample(online_batch_size, env=env)
+            # Sample from online buffer using explicit indices
+            online_idx = np.random.randint(0, self.size(), size=online_batch_size)
+            self._last_online_indices = online_idx
+            online_samples = self._get_samples(
+                th.tensor(online_idx, dtype=th.long), env=env
+            )
 
             # Concatenate
             return ReplayBufferSamples(
@@ -354,6 +362,506 @@ def inject_layernorm_into_critics(model):
     )
 
     print("LayerNorm + OFN injected into critic networks")
+
+
+def _inject_layernorm_cost_critic(model):
+    """Inject LayerNorm + OFN into cost critic networks and re-sync target."""
+    import torch
+    import torch.nn as nn
+
+    class OutputFeatureNorm(nn.Module):
+        def forward(self, x):
+            return x / (torch.norm(x, dim=-1, keepdim=True) + 1e-8)
+
+    def _inject_norms(sequential):
+        new_modules = []
+        modules = list(sequential)
+        for i, module in enumerate(modules):
+            if isinstance(module, nn.Linear):
+                remaining = modules[i + 1:]
+                has_more_linear = any(isinstance(m, nn.Linear) for m in remaining)
+                if has_more_linear:
+                    new_modules.append(module)
+                    new_modules.append(nn.LayerNorm(module.out_features))
+                else:
+                    new_modules.append(OutputFeatureNorm())
+                    new_modules.append(module)
+            else:
+                new_modules.append(module)
+        return nn.Sequential(*new_modules)
+
+    for i, qf in enumerate(model.cost_critic.q_networks):
+        model.cost_critic.q_networks[i] = _inject_norms(qf)
+    for i, qf in enumerate(model.cost_critic_target.q_networks):
+        model.cost_critic_target.q_networks[i] = _inject_norms(qf)
+
+    model.cost_critic = model.cost_critic.to(model.device)
+    model.cost_critic_target = model.cost_critic_target.to(model.device)
+    model.cost_critic_target.load_state_dict(model.cost_critic.state_dict())
+    model.cost_critic_optimizer = torch.optim.Adam(
+        model.cost_critic.parameters(), lr=model.lr_schedule(1)
+    )
+    print("LayerNorm + OFN injected into cost critic networks")
+
+
+class CostReplayBuffer:
+    """Parallel ring buffer storing per-transition costs alongside the main replay buffer.
+
+    Mirrors the main replay buffer's position so that costs can be retrieved
+    for the same transitions sampled by DemoReplayBuffer.
+    """
+
+    def __init__(self, buffer_size, device, demo_costs=None, demo_ratio=0.5):
+        """Initialize the CostReplayBuffer.
+
+        Args:
+            buffer_size: Max capacity for online costs
+            device: torch device
+            demo_costs: numpy array of demo chunk costs (N_demo,)
+            demo_ratio: fraction of batch from demos (for reference)
+        """
+        import torch as th
+        self.buffer_size = buffer_size
+        self.device = device
+        self.pos = 0
+        self.full = False
+        self.online_costs = np.zeros(buffer_size, dtype=np.float32)
+        if demo_costs is not None:
+            self.demo_costs = th.tensor(demo_costs, device=device, dtype=th.float32)
+        else:
+            self.demo_costs = None
+
+    def add(self, cost):
+        """Store a single transition cost at the current position."""
+        self.online_costs[self.pos] = cost
+        self.pos = (self.pos + 1) % self.buffer_size
+        if self.pos == 0:
+            self.full = True
+
+    def sample(self, demo_indices, online_indices):
+        """Retrieve costs for the same indices sampled by DemoReplayBuffer.
+
+        Args:
+            demo_indices: numpy array of demo indices (or None)
+            online_indices: numpy array of online buffer indices (or None)
+
+        Returns:
+            torch tensor of costs (batch, 1)
+        """
+        import torch as th
+        parts = []
+        if demo_indices is not None and self.demo_costs is not None:
+            parts.append(self.demo_costs[demo_indices].unsqueeze(1))
+        if online_indices is not None:
+            online_c = th.tensor(
+                self.online_costs[online_indices],
+                device=self.device, dtype=th.float32
+            ).unsqueeze(1)
+            parts.append(online_c)
+        return th.cat(parts, dim=0)
+
+
+class MeanCostCritic:
+    """Factory for creating a mean-value cost critic (twin-Q with MSE loss).
+
+    Creates n_critics MLP networks: (features_dim + action_dim) -> [256, 256] -> 1.
+    """
+
+    @staticmethod
+    def create(n_critics, features_dim, action_dim, fe_class, fe_kwargs, obs_space, device):
+        """Build cost critic networks with their own feature extractor.
+
+        Args:
+            n_critics: Number of critic networks
+            features_dim: Output dimension of feature extractor
+            action_dim: Action dimension
+            fe_class: Feature extractor class
+            fe_kwargs: Feature extractor kwargs
+            obs_space: Observation space
+            device: torch device
+
+        Returns:
+            (cost_critic, cost_critic_target) as nn.Module instances
+        """
+        import torch
+        import torch.nn as nn
+
+        class _CostCritic(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.features_extractor = fe_class(obs_space, **fe_kwargs)
+                self.n_critics = n_critics
+                self.q_networks = nn.ModuleList()
+                for _ in range(n_critics):
+                    self.q_networks.append(nn.Sequential(
+                        nn.Linear(features_dim + action_dim, 256),
+                        nn.ReLU(),
+                        nn.Linear(256, 256),
+                        nn.ReLU(),
+                        nn.Linear(256, 1),
+                    ))
+
+            def forward(self, obs, actions):
+                features = self.features_extractor(obs)
+                x = torch.cat([features, actions], dim=-1)
+                return [qf(x) for qf in self.q_networks]
+
+        critic = _CostCritic().to(device)
+        critic_target = _CostCritic().to(device)
+        critic_target.load_state_dict(critic.state_dict())
+        critic_target.requires_grad_(False)
+        return critic, critic_target
+
+
+def _create_safe_tqc_class(tqc_base_cls):
+    """Create SafeTQC class dynamically to handle TQC import availability.
+
+    Args:
+        tqc_base_cls: The TQC or SAC class to subclass
+
+    Returns:
+        SafeTQC class
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from stable_baselines3.common.utils import polyak_update
+
+    class SafeTQC(tqc_base_cls):
+        """TQC/SAC with learned Lagrange multiplier for constraint satisfaction.
+
+        Adds a cost critic that estimates cumulative constraint violation, and a
+        Lagrange multiplier that auto-balances reward maximization vs. safety.
+        """
+
+        def __init__(self, *args, cost_limit=25.0, lagrange_lr=3e-4,
+                     lagrange_init=0.0, cost_n_critics=2,
+                     cost_critic_type='mean', cost_buffer=None,
+                     max_episode_steps=500, **kwargs):
+            self._cost_limit = cost_limit
+            self._lagrange_lr = lagrange_lr
+            self._lagrange_init = lagrange_init
+            self._cost_n_critics = cost_n_critics
+            self._cost_critic_type = cost_critic_type
+            self.cost_buffer = cost_buffer
+            self._max_episode_steps = max_episode_steps
+            super().__init__(*args, **kwargs)
+
+        def _setup_model(self):
+            super()._setup_model()
+
+            # Lagrange multiplier (log-space for unconstrained optimization)
+            self.log_lagrange = nn.Parameter(
+                torch.tensor(self._lagrange_init, dtype=torch.float32,
+                             device=self.device)
+            )
+            self.lagrange_optimizer = torch.optim.Adam(
+                [self.log_lagrange], lr=self._lagrange_lr
+            )
+
+            # Cost critic
+            features_dim = self.actor.features_extractor._features_dim
+            action_dim = self.action_space.shape[0]
+            fe_class = type(self.actor.features_extractor)
+            fe_kwargs = dict(features_dim=features_dim)
+            obs_space = self.observation_space
+
+            self.cost_critic, self.cost_critic_target = MeanCostCritic.create(
+                self._cost_n_critics, features_dim, action_dim,
+                fe_class, fe_kwargs, obs_space, self.device
+            )
+
+            self.cost_critic_optimizer = torch.optim.Adam(
+                self.cost_critic.parameters(), lr=self.lr_schedule(1)
+            )
+
+            # Per-step cost limit for Lagrange update
+            self._cost_limit_per_step = self._cost_limit / self._max_episode_steps
+
+        def train(self, gradient_steps, batch_size=64):
+            # Switch to train mode
+            self.policy.set_training_mode(True)
+
+            # Update learning rate
+            self._update_learning_rate(
+                [self.actor.optimizer, self.critic.optimizer,
+                 self.cost_critic_optimizer]
+            )
+
+            ent_coef_losses, ent_coefs = [], []
+            actor_losses, critic_losses = [], []
+            cost_critic_losses, lagrange_values = [], []
+
+            for _ in range(gradient_steps):
+                # Sample replay buffer
+                replay_data = self.replay_buffer.sample(
+                    batch_size, env=self._vec_normalize_env
+                )
+
+                # Get cost data from parallel buffer
+                cost_data = None
+                if self.cost_buffer is not None:
+                    demo_idx = getattr(self.replay_buffer, '_last_demo_indices', None)
+                    online_idx = getattr(self.replay_buffer, '_last_online_indices', None)
+                    cost_data = self.cost_buffer.sample(demo_idx, online_idx)
+
+                # --- Entropy coefficient update ---
+                # Action by the current actor for the sampled observations
+                actions_pi, log_prob = self.actor.action_log_prob(
+                    replay_data.observations
+                )
+                log_prob = log_prob.reshape(-1, 1)
+
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+                ent_coef_loss = -(
+                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                ).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+
+                ent_coefs.append(ent_coef.item())
+
+                # --- Reward critic update ---
+                with torch.no_grad():
+                    next_actions, next_log_prob = self.actor.action_log_prob(
+                        replay_data.next_observations
+                    )
+                    next_log_prob = next_log_prob.reshape(-1, 1)
+
+                    # TQC-specific: use quantile targets
+                    if hasattr(self.critic_target, 'quantile_critics'):
+                        next_quantiles = []
+                        for critic_net in self.critic_target.quantile_critics:
+                            features = self.critic_target.features_extractor(
+                                replay_data.next_observations
+                            )
+                            x = torch.cat([features, next_actions], dim=-1)
+                            next_quantiles.append(critic_net(x))
+                        next_quantiles = torch.stack(next_quantiles, dim=1)
+                        # Sort and drop top quantiles
+                        sorted_q, _ = torch.sort(
+                            next_quantiles.reshape(batch_size, -1), dim=1
+                        )
+                        n_target_quantiles = sorted_q.shape[1] - self.top_quantiles_to_drop_per_net * len(self.critic_target.quantile_critics)
+                        if n_target_quantiles > 0:
+                            sorted_q = sorted_q[:, :n_target_quantiles]
+                        next_q = sorted_q.mean(dim=1, keepdim=True)
+                    else:
+                        # SAC: min of two Q-values
+                        next_q_values = self.critic_target(
+                            replay_data.next_observations, next_actions
+                        )
+                        if isinstance(next_q_values, list):
+                            next_q = torch.min(
+                                torch.cat(next_q_values, dim=1), dim=1, keepdim=True
+                            )[0]
+                        else:
+                            next_q = next_q_values
+
+                    target_q = replay_data.rewards + (
+                        1 - replay_data.dones
+                    ) * self.gamma * (next_q - ent_coef * next_log_prob)
+
+                # Current Q-values
+                if hasattr(self.critic, 'quantile_critics'):
+                    current_quantiles = []
+                    features = self.critic.features_extractor(
+                        replay_data.observations
+                    )
+                    x = torch.cat([features, replay_data.actions], dim=-1)
+                    for critic_net in self.critic.quantile_critics:
+                        current_quantiles.append(critic_net(x))
+                    # Quantile Huber loss
+                    critic_loss = 0.0
+                    n_quantiles = current_quantiles[0].shape[1]
+                    tau = (torch.arange(n_quantiles, device=self.device, dtype=torch.float32) + 0.5) / n_quantiles
+                    for current_q in current_quantiles:
+                        # (batch, n_quantiles, 1) - (batch, 1, 1) -> (batch, n_quantiles, 1)
+                        td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
+                        huber = F.smooth_l1_loss(current_q.unsqueeze(2),
+                                                 target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
+                                                 reduction='none')
+                        quantile_loss = torch.abs(tau.view(1, -1, 1) - (td_error < 0).float()) * huber
+                        critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
+                else:
+                    current_q1 = self.critic.qf0(
+                        torch.cat([self.critic.features_extractor(replay_data.observations), replay_data.actions], dim=-1)
+                    )
+                    current_q2 = self.critic.qf1(
+                        torch.cat([self.critic.features_extractor(replay_data.observations), replay_data.actions], dim=-1)
+                    )
+                    critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+
+                critic_losses.append(critic_loss.item())
+
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                # --- Cost critic update ---
+                if cost_data is not None:
+                    with torch.no_grad():
+                        next_cost_values = self.cost_critic_target(
+                            replay_data.next_observations, next_actions
+                        )
+                        next_cost_q = torch.min(
+                            torch.cat(next_cost_values, dim=1), dim=1, keepdim=True
+                        )[0]
+                        cost_target = cost_data + (
+                            1 - replay_data.dones
+                        ) * self.gamma * next_cost_q
+
+                    current_cost_values = self.cost_critic(
+                        replay_data.observations, replay_data.actions
+                    )
+                    cost_critic_loss = sum(
+                        F.mse_loss(qc, cost_target) for qc in current_cost_values
+                    )
+                    cost_critic_losses.append(cost_critic_loss.item())
+
+                    self.cost_critic_optimizer.zero_grad()
+                    cost_critic_loss.backward()
+                    self.cost_critic_optimizer.step()
+
+                # --- Actor update ---
+                # Q-values for current actions
+                if hasattr(self.critic, 'quantile_critics'):
+                    q_values = []
+                    features_pi = self.critic.features_extractor(
+                        replay_data.observations
+                    )
+                    x_pi = torch.cat([features_pi, actions_pi], dim=-1)
+                    for critic_net in self.critic.quantile_critics:
+                        q_values.append(critic_net(x_pi).mean(dim=1, keepdim=True))
+                    qf_pi = torch.cat(q_values, dim=1).mean(dim=1, keepdim=True)
+                else:
+                    q1_pi = self.critic.qf0(
+                        torch.cat([self.critic.features_extractor(replay_data.observations), actions_pi], dim=-1)
+                    )
+                    q2_pi = self.critic.qf1(
+                        torch.cat([self.critic.features_extractor(replay_data.observations), actions_pi], dim=-1)
+                    )
+                    qf_pi = torch.min(q1_pi, q2_pi)
+
+                # Lagrange-penalized actor loss
+                lagrange = F.softplus(self.log_lagrange).detach()
+                if cost_data is not None:
+                    cost_q_values = self.cost_critic(
+                        replay_data.observations, actions_pi
+                    )
+                    qc_pi = torch.min(
+                        torch.cat(cost_q_values, dim=1), dim=1, keepdim=True
+                    )[0]
+                    actor_loss = (ent_coef * log_prob - qf_pi + lagrange * qc_pi).mean()
+                else:
+                    actor_loss = (ent_coef * log_prob - qf_pi).mean()
+
+                actor_losses.append(actor_loss.item())
+
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor.optimizer.step()
+
+                # --- Lagrange multiplier update ---
+                if cost_data is not None:
+                    batch_cost_mean = cost_data.mean()
+                    lam_loss = -F.softplus(self.log_lagrange) * (
+                        batch_cost_mean - self._cost_limit_per_step
+                    )
+                    self.lagrange_optimizer.zero_grad()
+                    lam_loss.backward()
+                    self.lagrange_optimizer.step()
+                    lagrange_values.append(F.softplus(self.log_lagrange).item())
+
+                # --- Target network update ---
+                polyak_update(
+                    self.critic.parameters(),
+                    self.critic_target.parameters(),
+                    self.tau
+                )
+                if cost_data is not None:
+                    polyak_update(
+                        self.cost_critic.parameters(),
+                        self.cost_critic_target.parameters(),
+                        self.tau
+                    )
+
+            # Logging
+            self._n_updates += gradient_steps
+            self.logger.record("train/n_updates", self._n_updates)
+            self.logger.record("train/ent_coef", np.mean(ent_coefs))
+            self.logger.record("train/actor_loss", np.mean(actor_losses))
+            self.logger.record("train/critic_loss", np.mean(critic_losses))
+            if ent_coef_losses:
+                self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+            if cost_critic_losses:
+                self.logger.record("train/cost_critic_loss", np.mean(cost_critic_losses))
+            if lagrange_values:
+                self.logger.record("train/lagrange", np.mean(lagrange_values))
+
+        def _get_torch_save_params(self):
+            state_dicts, saved_vars = super()._get_torch_save_params()
+            state_dicts += [
+                "cost_critic.state_dict",
+                "cost_critic_target.state_dict",
+                "cost_critic_optimizer.state_dict",
+            ]
+            saved_vars += ["log_lagrange"]
+            return state_dicts, saved_vars
+
+        def _excluded_save_params(self):
+            excluded = super()._excluded_save_params()
+            excluded.add("cost_buffer")
+            return excluded
+
+    return SafeTQC
+
+
+class SafeTrainingCallback:
+    """Factory for creating the SafeTQC training callback.
+
+    Tracks per-transition costs and per-episode cumulative costs.
+    """
+
+    @staticmethod
+    def create(base_callback_cls):
+        """Create callback class using the imported BaseCallback."""
+
+        class _SafeTrainingCallback(base_callback_cls):
+            def __init__(self, cost_buffer):
+                super().__init__(verbose=0)
+                self.cost_buffer = cost_buffer
+                self._ep_cost = 0.0
+                self._ep_costs = []
+
+            def _on_step(self):
+                infos = self.locals.get('infos', [{}])
+                dones = self.locals.get('dones', [False])
+
+                for i in range(len(dones)):
+                    info = infos[i] if i < len(infos) else {}
+                    cost = info.get('cost_chunk', info.get('cost', 0.0))
+                    self.cost_buffer.add(cost)
+                    self._ep_cost += cost
+
+                    if dones[i]:
+                        self._ep_costs.append(self._ep_cost)
+                        self._ep_cost = 0.0
+
+                # Log periodically
+                if self._ep_costs and self.num_timesteps % 100 == 0:
+                    self.logger.record("safe/mean_episode_cost", np.mean(self._ep_costs[-100:]))
+                    lagrange = getattr(self.model, 'log_lagrange', None)
+                    if lagrange is not None:
+                        import torch
+                        self.logger.record("safe/lagrange", torch.nn.functional.softplus(lagrange).item())
+
+                return True
+
+        return _SafeTrainingCallback
 
 
 def main():
@@ -448,6 +956,27 @@ Examples:
     parser.add_argument('--tensorboard-log', type=str, default='./runs/',
                         help='TensorBoard log directory (default: ./runs/)')
 
+    # Safe RL arguments
+    safe_group = parser.add_argument_group('Safe RL (SafeTQC)')
+    safe_group.add_argument('--safe', action='store_true',
+                            help='Enable SafeTQC with cost critic + Lagrange multiplier')
+    safe_group.add_argument('--cost-limit', type=float, default=25.0,
+                            help='Per-episode cost budget (default: 25.0)')
+    safe_group.add_argument('--lagrange-lr', type=float, default=3e-4,
+                            help='Lagrange multiplier learning rate (default: 3e-4)')
+    safe_group.add_argument('--lagrange-init', type=float, default=0.0,
+                            help='Initial log-lambda value (default: 0.0)')
+    safe_group.add_argument('--cost-n-critics', type=int, default=2,
+                            help='Number of cost critic networks (default: 2)')
+    safe_group.add_argument('--cost-critic-type', choices=['mean', 'quantile'],
+                            default='mean',
+                            help='Cost critic type: mean (MSE) or quantile (default: mean)')
+    safe_group.add_argument('--cost-type', choices=['proximity', 'collision', 'both'],
+                            default='proximity',
+                            help='Cost signal type (default: proximity)')
+    safe_group.add_argument('--keep-proximity-reward', action='store_true',
+                            help='Keep proximity penalty in reward even with --safe')
+
     args = parser.parse_args()
 
     # Validate demo_ratio
@@ -484,10 +1013,17 @@ Examples:
     print(f"  TensorBoard: {args.tensorboard_log}")
     if args.resume:
         print(f"  Resuming from: {args.resume}")
+    if args.safe:
+        print(f"  SafeTQC: ENABLED")
+        print(f"    Cost limit: {args.cost_limit}")
+        print(f"    Cost type: {args.cost_type}")
+        print(f"    Cost critics: {args.cost_n_critics} ({args.cost_critic_type})")
+        print(f"    Lagrange LR: {args.lagrange_lr}, init: {args.lagrange_init}")
+        print(f"    Keep proximity reward: {args.keep_proximity_reward}")
     print("=" * 60 + "\n")
 
     # Validate demo data first (fail fast)
-    validate_demo_data(args.demos)
+    validate_demo_data(args.demos, require_cost=args.safe)
 
     # Import here to allow --help without Isaac Sim
     import torch
@@ -509,6 +1045,12 @@ Examples:
         algo_name = "SAC"
         print("sb3-contrib not found, falling back to SAC")
 
+    # Wrap with SafeTQC if --safe
+    if args.safe:
+        SafeTQC = _create_safe_tqc_class(algo_cls)
+        algo_cls = SafeTQC
+        algo_name = f"Safe{algo_name}"
+
     print(f"Using algorithm: {algo_name}")
 
     # Create environment with ChunkedEnvWrapper
@@ -517,6 +1059,7 @@ Examples:
     _t0 = _time.time()
     half = args.arena_size / 2.0
     workspace_bounds = {'x': [-half, half], 'y': [-half, half]}
+    safe_mode = args.safe and not args.keep_proximity_reward
     raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
         headless=args.headless,
@@ -525,6 +1068,8 @@ Examples:
         max_episode_steps=args.max_steps,
         min_goal_dist=args.min_goal,
         inflation_radius=args.inflation_radius,
+        cost_type=getattr(args, 'cost_type', 'proximity'),
+        safe_mode=safe_mode,
     )
     raw_env = ChunkedEnvWrapper(raw_env, chunk_size=args.chunk_size, gamma=args.gamma)
     print(f"  Environment created in {_time.time() - _t0:.1f}s")
@@ -537,16 +1082,27 @@ Examples:
 
     # Load step-level demo transitions (for CVAE pretraining)
     print("Loading demo transitions...")
-    demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step = \
-        load_demo_transitions(args.demos)
+    demo_costs_step = None
+    if args.safe:
+        demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step, demo_costs_step = \
+            load_demo_transitions(args.demos, load_costs=True)
+    else:
+        demo_obs_step, demo_actions_step, demo_rewards_step, _, demo_dones_step = \
+            load_demo_transitions(args.demos)
     demo_data = np.load(args.demos, allow_pickle=True)
     episode_lengths = demo_data['episode_lengths']
 
     # Build chunk-level transitions (for replay buffer)
     print("Building chunk-level transitions...")
-    chunk_obs, chunk_acts, chunk_rews, chunk_next, chunk_dones = make_chunk_transitions(
-        demo_obs_step, demo_actions_step, demo_rewards_step, demo_dones_step,
-        episode_lengths, args.chunk_size, args.gamma)
+    chunk_costs = None
+    if args.safe and demo_costs_step is not None:
+        chunk_obs, chunk_acts, chunk_rews, chunk_next, chunk_dones, chunk_costs = make_chunk_transitions(
+            demo_obs_step, demo_actions_step, demo_rewards_step, demo_dones_step,
+            episode_lengths, args.chunk_size, args.gamma, demo_costs=demo_costs_step)
+    else:
+        chunk_obs, chunk_acts, chunk_rews, chunk_next, chunk_dones = make_chunk_transitions(
+            demo_obs_step, demo_actions_step, demo_rewards_step, demo_dones_step,
+            episode_lengths, args.chunk_size, args.gamma)
     print(f"  {len(chunk_obs)} chunk transitions from {len(episode_lengths)} episodes")
     print()
 
@@ -570,6 +1126,16 @@ Examples:
         demo_ratio=args.demo_ratio,
     )
     print(f"Demo replay buffer created: {len(chunk_obs)} chunk-level demo transitions")
+
+    # Create cost replay buffer if safe mode
+    cost_buffer = None
+    if args.safe:
+        cost_buffer = CostReplayBuffer(
+            args.buffer_size, device,
+            demo_costs=chunk_costs,
+            demo_ratio=args.demo_ratio,
+        )
+        print(f"Cost replay buffer created: {len(chunk_costs) if chunk_costs is not None else 0} demo costs")
     print()
 
     # Effective gamma for chunk-level Bellman updates
@@ -618,9 +1184,7 @@ Examples:
         if algo_name == "TQC":
             policy_kwargs['n_critics'] = 5
 
-        model = algo_cls(
-            "MlpPolicy",
-            env,
+        model_kwargs = dict(
             verbose=1,
             device=device_str,
             tensorboard_log=args.tensorboard_log,
@@ -637,10 +1201,24 @@ Examples:
             train_freq=1,
             policy_kwargs=policy_kwargs,
         )
+        if args.safe:
+            model_kwargs.update(dict(
+                cost_limit=args.cost_limit,
+                lagrange_lr=args.lagrange_lr,
+                lagrange_init=args.lagrange_init,
+                cost_n_critics=args.cost_n_critics,
+                cost_critic_type=args.cost_critic_type,
+                cost_buffer=cost_buffer,
+                max_episode_steps=args.max_steps,
+            ))
+        model = algo_cls("MlpPolicy", env, **model_kwargs)
         # Replace the default replay buffer with our demo buffer
         model.replay_buffer = replay_buffer
         # Inject LayerNorm into critics
         inject_layernorm_into_critics(model)
+        # Also inject LayerNorm into cost critic if safe mode
+        if args.safe and hasattr(model, 'cost_critic'):
+            _inject_layernorm_cost_critic(model)
         print(f"  Model created in {_time.time() - _t0:.1f}s")
     print()
 
@@ -652,12 +1230,21 @@ Examples:
             epochs=args.cvae_epochs, batch_size=args.batch_size,
             lr=args.cvae_lr, beta=args.cvae_beta, gamma=args.gamma,
         )
+        # Copy pretrained FE weights to cost critic too
+        if args.safe and hasattr(model, 'cost_critic'):
+            fe_state = model.actor.features_extractor.state_dict()
+            model.cost_critic.features_extractor.load_state_dict(fe_state)
+            model.cost_critic_target.features_extractor.load_state_dict(fe_state)
+            print("  Feature extractor weights copied to cost critic/cost_critic_target")
 
     # Create callbacks
     checkpoint_dir = Path(args.output).parent / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    prefix = "tqc_jetbot" if algo_name == "TQC" else "sac_jetbot"
+    if "Safe" in algo_name:
+        prefix = "safe_tqc_jetbot" if "TQC" in algo_name else "safe_sac_jetbot"
+    else:
+        prefix = "tqc_jetbot" if algo_name == "TQC" else "sac_jetbot"
     checkpoint_callback = CheckpointCallback(
         save_freq=args.checkpoint_freq,
         save_path=str(checkpoint_dir),
@@ -667,6 +1254,9 @@ Examples:
     callbacks = [checkpoint_callback]
     if args.more_debug:
         callbacks.append(VerboseEpisodeCallback.create(BaseCallback))
+    if args.safe and cost_buffer is not None:
+        safe_cb_cls = SafeTrainingCallback.create(BaseCallback)
+        callbacks.append(safe_cb_cls(cost_buffer))
     callback = CallbackList(callbacks)
 
     # Train

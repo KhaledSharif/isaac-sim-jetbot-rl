@@ -39,6 +39,11 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - UTD ratio configurable via `--utd-ratio` (default 20, recommended 5 for speed)
    - `--resume` to continue training from a checkpoint (step counter, weights preserved)
    - `--chunk-size` to control action chunk length (default 10)
+   - **SafeTQC** (`--safe`): Constrained RL with dual critic + Lagrange multiplier
+     - Separate cost critic estimates obstacle violation costs
+     - Learned Lagrange multiplier auto-balances reward vs. safety
+     - Auto-removes proximity penalty from reward (override with `--keep-proximity-reward`)
+     - Requires demos recorded with cost data (`has_cost` metadata)
 
 5. **Supporting Scripts**
    - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO and chunk size from model action space; wraps env with `ChunkedEnvWrapper` for chunked models)
@@ -53,11 +58,11 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 
 - **TUIRenderer**: Rich-based terminal UI for robot state display
 - **SceneManager**: Manages goal markers and scene objects
-- **DemoRecorder**: Records (obs, action, reward, done) tuples to NPZ
+- **DemoRecorder**: Records (obs, action, reward, done, cost) tuples to NPZ
 - **DemoPlayer**: Loads and replays recorded demonstrations
 - **ActionMapper**: Maps keyboard keys to velocity commands
 - **ObservationBuilder**: Builds observation vectors from robot state
-- **RewardComputer**: Computes navigation rewards
+- **RewardComputer**: Computes navigation rewards; `compute_cost()` static method for SafeTQC cost signal; `safe_mode` suppresses proximity penalty
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming (`src/camera_streamer.py`)
 - **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
 - **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
@@ -65,6 +70,10 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`)
 - **ChunkCVAEFeatureExtractor**: SB3 feature extractor splitting obs into state MLP (10→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D
 - **pretrain_chunk_cvae()**: CVAE pretraining — encoder maps (obs, action_chunk) → z, decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk; encoder discarded after pretraining
+- **SafeTQC**: TQC subclass with dual cost critic + Lagrange multiplier for constrained RL (`src/train_sac.py`)
+- **CostReplayBuffer**: Parallel ring buffer storing per-transition costs alongside the main replay buffer (`src/train_sac.py`)
+- **MeanCostCritic**: Twin-Q mean-value cost critic with independent feature extractor (`src/train_sac.py`)
+- **SafeTrainingCallback**: SB3 callback tracking per-transition and per-episode costs, logging to TensorBoard (`src/train_sac.py`)
 
 ### Training Pipeline Functions (`src/train_rl.py`)
 
@@ -175,9 +184,21 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # Resume SAC/TQC training from checkpoint
 ./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
 
+# SafeTQC: constrained RL with cost critic + Lagrange multiplier
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe
+
+# SafeTQC with custom cost limit and cost type
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe --cost-limit 10.0 --cost-type both
+
+# SafeTQC keeping proximity penalty in reward (default: auto-removed)
+./run.sh train_sac.py --demos demos/recording.npz --headless --safe --keep-proximity-reward
+
 # Evaluation (auto-detects TQC/SAC/PPO and chunk size)
 ./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100
 ./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
+
+# Evaluation with cost tracking
+./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100 --safe --cost-type proximity
 
 # Evaluation with explicit chunk size or inflation radius
 ./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
@@ -330,6 +351,25 @@ CVAE pretraining (replaces BC warmstart):
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
+| `--safe` | off | Enable SafeTQC (cost critic + Lagrange) |
+| `--cost-limit` | 25.0 | Per-episode cost budget |
+| `--lagrange-lr` | 3e-4 | Lagrange multiplier learning rate |
+| `--lagrange-init` | 0.0 | Initial log-lambda |
+| `--cost-n-critics` | 2 | Number of cost critic networks |
+| `--cost-critic-type` | mean | `mean` (MSE) or `quantile` |
+| `--cost-type` | proximity | `proximity`, `collision`, or `both` |
+| `--keep-proximity-reward` | off | Keep proximity penalty with `--safe` |
+
+### SafeTQC Pipeline Order
+1. Create env with `ChunkedEnvWrapper` + `safe_mode=True` (disables proximity penalty in reward)
+2. Load demo transitions with costs (`load_costs=True`)
+3. Build chunk-level transitions with costs (`demo_costs=...`)
+4. Create `CostReplayBuffer` with demo chunk costs
+5. Create `SafeTQC` model (cost critic + Lagrange multiplier)
+6. Inject LayerNorm into reward critics and cost critics
+7. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks
+8. Copy pretrained feature extractor weights → reward critic + cost critic
+9. Train with `SafeTrainingCallback` tracking per-step costs
 
 ### Compatibility
 - `inject_layernorm_into_critics`: Unaffected — operates on critic nets after feature extraction
@@ -378,7 +418,7 @@ Per-test behaviour can still be customised by overriding the instance's `step` a
 - **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
 - **Distance shaping**: `(prev_dist - curr_dist) * 1.0`
 - **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1`
-- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m, gated by goal distance (linearly reduced within 0.5m of goal, zero at goal)
+- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m, gated by goal distance (linearly reduced within 0.5m of goal, zero at goal). Auto-removed when `--safe` is active (handled by cost critic); `--keep-proximity-reward` to override
 - **Time penalty**: -0.005 per step
 
 ### Sparse Mode

@@ -74,6 +74,11 @@ Examples:
                         help='Action chunk size (default: auto-detect from model)')
     parser.add_argument('--inflation-radius', type=float, default=0.08,
                         help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
+    parser.add_argument('--safe', action='store_true',
+                        help='Track constraint costs during evaluation')
+    parser.add_argument('--cost-type', choices=['proximity', 'collision', 'both'],
+                        default='proximity',
+                        help='Cost signal type for evaluation (default: proximity)')
 
     args = parser.parse_args()
 
@@ -118,6 +123,7 @@ Examples:
         reward_mode=args.reward_mode,
         headless=args.headless,
         inflation_radius=args.inflation_radius,
+        cost_type=args.cost_type,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space (inner): {raw_env.action_space.shape}")
@@ -188,6 +194,7 @@ Examples:
     successes = 0
     total_rewards = []
     episode_lengths = []
+    episode_costs = []
     deterministic = not args.stochastic
 
     print("=" * 60)
@@ -202,6 +209,7 @@ Examples:
 
         done = False
         episode_reward = 0.0
+        episode_cost = 0.0
         steps = 0
         goal_reached = False
 
@@ -212,6 +220,7 @@ Examples:
             # Step environment (VecEnv API: returns arrays, infos is list of dicts)
             obs, rewards, dones, infos = vec_env.step(action)
             episode_reward += rewards[0]
+            episode_cost += infos[0].get('cost_chunk', infos[0].get('cost', 0.0))
             steps += 1
             done = dones[0]
 
@@ -225,11 +234,13 @@ Examples:
 
         total_rewards.append(episode_reward)
         episode_lengths.append(steps)
+        episode_costs.append(episode_cost)
 
         # Print episode summary
         status = "SUCCESS" if goal_reached else "FAILED"
+        cost_str = f", cost={episode_cost:6.2f}" if args.safe else ""
         print(f"Episode {episode + 1:3d}/{args.episodes}: "
-              f"reward={episode_reward:8.2f}, steps={steps:4d}, {status}")
+              f"reward={episode_reward:8.2f}, steps={steps:4d}{cost_str}, {status}")
 
     # Compute statistics
     metrics = compute_eval_metrics(successes, total_rewards, episode_lengths, args.episodes)
@@ -244,6 +255,12 @@ Examples:
     print(f"  Average length:    {metrics['avg_length']:.1f} +/- {metrics['std_length']:.1f} {step_label}")
     print(f"  Min reward:        {metrics['min_reward']:.2f}")
     print(f"  Max reward:        {metrics['max_reward']:.2f}")
+    if args.safe and episode_costs:
+        mean_cost = float(np.mean(episode_costs))
+        std_cost = float(np.std(episode_costs))
+        exceedances = sum(1 for c in episode_costs if c > 25.0)
+        print(f"  Mean episode cost: {mean_cost:.2f} +/- {std_cost:.2f}")
+        print(f"  Budget exceedances: {exceedances}/{args.episodes} (budget=25.0)")
     print("=" * 60)
 
     # Return success rate as exit code (0-100)
