@@ -60,6 +60,7 @@ from train_sac import (
     CostReplayBuffer,
     MeanCostCritic,
     _create_safe_tqc_class,
+    _create_dual_policy_class,
 )
 from demo_utils import extract_action_chunks, make_chunk_transitions
 from jetbot_rl_env import ChunkedEnvWrapper
@@ -1126,3 +1127,249 @@ class TestMeanCostCritic:
                 critic.state_dict()[key],
                 critic_target.state_dict()[key],
             )
+
+
+# ============================================================================
+# TEST SUITE: DualPolicyTQC (IBRL)
+# ============================================================================
+
+class TestDualPolicyTQC:
+    """Tests for _create_dual_policy_class (IBRL dual-policy)."""
+
+    def _make_base_cls(self):
+        """Return a minimal stub that quacks like TQC/SAC for our tests."""
+        import torch.nn as nn
+
+        class _StubBase:
+            pass
+
+        return _StubBase
+
+    def _make_dual_policy_instance(self):
+        """Create a bare DualPolicyTQC instance without calling __init__."""
+        import torch
+        import torch.nn as nn
+
+        DualPolicyClass = _create_dual_policy_class(self._make_base_cls())
+        obj = object.__new__(DualPolicyClass)
+        obj.il_actor = None
+        obj.il_noise_std = 0.0
+        obj.il_soft = False
+        obj.il_beta = 10.0
+        obj.device = torch.device('cpu')
+        return obj, DualPolicyClass
+
+    def _make_fake_tqc_critic(self, n_critics=2, n_quantiles=4, obs_dim=34, act_dim=2):
+        """FakeCritic with quantile_critics and Identity features_extractor."""
+        import torch
+        import torch.nn as nn
+
+        class _FakeTQCCritic(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.features_extractor = nn.Identity()
+                self.quantile_critics = nn.ModuleList([
+                    nn.Linear(obs_dim + act_dim, n_quantiles)
+                    for _ in range(n_critics)
+                ])
+
+        critic = _FakeTQCCritic()
+        # Make each quantile critic return known constant outputs
+        for i, net in enumerate(critic.quantile_critics):
+            with torch.no_grad():
+                nn.init.constant_(net.weight, 0.0)
+                nn.init.constant_(net.bias, float(i + 1))  # net 0 → 1.0, net 1 → 2.0
+
+        return critic
+
+    def test_ibrl_min_q_tqc_path(self):
+        """_ibrl_min_q returns (batch,) min-over-critics for TQC critic."""
+        import torch
+
+        obj, _ = self._make_dual_policy_instance()
+        critic = self._make_fake_tqc_critic(n_critics=2, n_quantiles=4)
+        obj.critic = critic
+
+        batch = 3
+        obs = torch.zeros(batch, 34)
+        act = torch.zeros(batch, 2)
+
+        result = obj._ibrl_min_q(obs, act)
+
+        assert result.shape == (batch,), f"Expected ({batch},), got {result.shape}"
+        # net 0 outputs all-ones → mean=1.0, net 1 outputs all-twos → mean=2.0
+        # min over critics = 1.0
+        torch.testing.assert_close(result, torch.ones(batch), atol=1e-5, rtol=1e-5)
+
+    def test_ibrl_min_q_sac_path(self):
+        """_ibrl_min_q with list-returning critic (SAC-style) → correct min."""
+        import torch
+
+        obj, _ = self._make_dual_policy_instance()
+
+        # SAC-style critic that returns [q0, q1] as list
+        class _SACCritic:
+            def __call__(self, obs, act):
+                batch = obs.shape[0]
+                q0 = torch.full((batch, 1), 3.0)
+                q1 = torch.full((batch, 1), 7.0)
+                return [q0, q1]
+
+            def __getattr__(self, name):
+                # No quantile_critics attribute → returns None from _get_tqc_quantile_critics
+                raise AttributeError(name)
+
+        obj.critic = _SACCritic()
+
+        batch = 5
+        obs = torch.zeros(batch, 34)
+        act = torch.zeros(batch, 2)
+
+        result = obj._ibrl_min_q(obs, act)
+
+        assert result.shape == (batch,)
+        torch.testing.assert_close(result, torch.full((batch,), 3.0), atol=1e-5, rtol=1e-5)
+
+    def test_greedy_selects_il_when_q_il_higher(self):
+        """Greedy selection returns IL action when Q_IL > Q_RL."""
+        import torch
+        import numpy as np
+        from unittest.mock import Mock
+
+        obj, DualPolicyClass = self._make_dual_policy_instance()
+
+        batch = 2
+        a_rl = torch.zeros(batch, 4)          # known RL action (zeros)
+        a_il = torch.ones(batch, 4) * 0.5     # known IL action (0.5s)
+
+        obj.num_timesteps = 100
+        obj._last_obs = np.zeros((batch, 34), dtype=np.float32)
+
+        actor_mock = Mock()
+        actor_mock._predict = Mock(return_value=a_rl)
+        obj.actor = actor_mock
+
+        il_actor_mock = Mock()
+        il_actor_mock._predict = Mock(return_value=a_il)
+        obj.il_actor = il_actor_mock
+
+        obj.il_noise_std = 0.0  # no noise to ensure determinism
+
+        policy_mock = Mock()
+        policy_mock.unscale_action = lambda x: x
+        obj.policy = policy_mock
+
+        # Patch _ibrl_min_q: IL Q=5 (higher), RL Q=1
+        call_count = [0]
+        def mock_min_q(obs, action):
+            val = 1.0 if call_count[0] == 0 else 5.0
+            call_count[0] += 1
+            return torch.full((batch,), val)
+
+        obj._ibrl_min_q = mock_min_q
+
+        action_np, buffer_action_np = DualPolicyClass._sample_action(
+            obj, learning_starts=0
+        )
+
+        # Should select IL action (0.5s)
+        np.testing.assert_allclose(buffer_action_np, a_il.numpy(), atol=1e-5)
+
+    def test_greedy_selects_rl_when_q_rl_higher(self):
+        """Greedy selection returns RL action when Q_RL > Q_IL."""
+        import torch
+        import numpy as np
+        from unittest.mock import Mock
+
+        obj, DualPolicyClass = self._make_dual_policy_instance()
+
+        batch = 2
+        a_rl = torch.zeros(batch, 4)
+        a_il = torch.ones(batch, 4) * 0.5
+
+        obj.num_timesteps = 100
+        obj._last_obs = np.zeros((batch, 34), dtype=np.float32)
+
+        actor_mock = Mock()
+        actor_mock._predict = Mock(return_value=a_rl)
+        obj.actor = actor_mock
+
+        il_actor_mock = Mock()
+        il_actor_mock._predict = Mock(return_value=a_il)
+        obj.il_actor = il_actor_mock
+
+        obj.il_noise_std = 0.0
+
+        policy_mock = Mock()
+        policy_mock.unscale_action = lambda x: x
+        obj.policy = policy_mock
+
+        # RL Q=5 (higher), IL Q=1
+        call_count = [0]
+        def mock_min_q(obs, action):
+            val = 5.0 if call_count[0] == 0 else 1.0
+            call_count[0] += 1
+            return torch.full((batch,), val)
+
+        obj._ibrl_min_q = mock_min_q
+
+        action_np, buffer_action_np = DualPolicyClass._sample_action(
+            obj, learning_starts=0
+        )
+
+        # Should select RL action (zeros)
+        np.testing.assert_allclose(buffer_action_np, a_rl.numpy(), atol=1e-5)
+
+    def test_soft_selection_uses_il_with_high_beta(self):
+        """Soft (Boltzmann) selection with high beta strongly prefers IL when Q_IL >> Q_RL."""
+        import torch
+        import numpy as np
+        from unittest.mock import Mock
+
+        obj, DualPolicyClass = self._make_dual_policy_instance()
+
+        obj.il_soft = True
+        obj.il_beta = 1000.0   # very high temp → effectively deterministic toward best
+        obj.il_noise_std = 0.0
+
+        batch = 1
+        a_rl = torch.zeros(batch, 4)
+        a_il = torch.ones(batch, 4) * 0.5
+
+        obj.num_timesteps = 100
+        obj._last_obs = np.zeros((batch, 34), dtype=np.float32)
+
+        actor_mock = Mock()
+        actor_mock._predict = Mock(return_value=a_rl)
+        obj.actor = actor_mock
+
+        il_actor_mock = Mock()
+        il_actor_mock._predict = Mock(return_value=a_il)
+        obj.il_actor = il_actor_mock
+
+        policy_mock = Mock()
+        policy_mock.unscale_action = lambda x: x
+        obj.policy = policy_mock
+
+        # IL Q=5, RL Q=1 → with beta=1000, softmax heavily favours IL
+        call_count = [0]
+        def mock_min_q(obs, action):
+            val = 1.0 if call_count[0] == 0 else 5.0
+            call_count[0] += 1
+            return torch.full((batch,), val)
+
+        obj._ibrl_min_q = mock_min_q
+
+        # Run multiple times to verify IL wins consistently
+        wins_il = 0
+        runs = 20
+        for _ in range(runs):
+            call_count[0] = 0
+            _, buffer_action_np = DualPolicyClass._sample_action(
+                obj, learning_starts=0
+            )
+            if np.allclose(buffer_action_np, a_il.numpy(), atol=0.1):
+                wins_il += 1
+
+        # With beta=1000 and Q_IL >> Q_RL, IL should win nearly every time
+        assert wins_il >= 18, f"Expected IL to win >= 18/20 runs, got {wins_il}/20"
