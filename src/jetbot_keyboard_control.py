@@ -882,11 +882,13 @@ class DemoRecorder:
                 self.finalize_episode()
 
         # Build metadata
+        from jetbot_config import OBS_VERSION
         save_metadata = {
             'obs_dim': self.obs_dim,
             'action_dim': self.action_dim,
             'num_episodes': len(self.episode_starts),
             'total_frames': len(self.observations),
+            'obs_version': OBS_VERSION,
         }
         if metadata:
             save_metadata.update(metadata)
@@ -1034,16 +1036,18 @@ class ActionMapper:
 
 
 class ObservationBuilder:
-    """Builds observation vectors from robot state.
+    """Builds ego-centric observation vectors from robot state.
 
     Observation layout (10D base, or 10+N with LiDAR):
-        [0:2]  - robot position (x, y)
-        [2]    - robot heading (theta)
-        [3]    - linear velocity
-        [4]    - angular velocity
-        [5:7]  - goal position (x, y)
-        [7]    - distance to goal
-        [8]    - angle to goal (relative heading)
+        [0]    - normalized workspace x: (x - x_min) / (x_max - x_min)
+        [1]    - normalized workspace y: (y - y_min) / (y_max - y_min)
+        [2]    - sin(heading)
+        [3]    - cos(heading)
+        [4]    - linear velocity
+        [5]    - angular velocity
+        [6]    - goal body-frame x: dist * cos(angle_to_goal)
+        [7]    - goal body-frame y: dist * sin(angle_to_goal)
+        [8]    - distance to goal
         [9]    - goal reached flag
         [10:]  - (optional) normalized LiDAR distances
     """
@@ -1066,7 +1070,7 @@ class ObservationBuilder:
               goal_position: np.ndarray, goal_reached: bool,
               obstacle_metadata: list = None,
               workspace_bounds: dict = None) -> np.ndarray:
-        """Build an observation vector from robot state.
+        """Build an ego-centric observation vector from robot state.
 
         Args:
             robot_position: Robot [x, y] or [x, y, z] position
@@ -1081,6 +1085,8 @@ class ObservationBuilder:
         Returns:
             Observation vector as float32 (10D without LiDAR, 10+N with LiDAR)
         """
+        from jetbot_config import DEFAULT_WORKSPACE_BOUNDS
+
         # Extract 2D positions
         robot_pos_2d = np.array(robot_position[:2], dtype=np.float32)
         goal_pos_2d = np.array(goal_position[:2], dtype=np.float32)
@@ -1095,16 +1101,29 @@ class ObservationBuilder:
         # Normalize to [-pi, pi]
         angle_to_goal = np.arctan2(np.sin(angle_to_goal), np.cos(angle_to_goal))
 
+        # Ego-centric features
+        bounds = workspace_bounds if workspace_bounds is not None else DEFAULT_WORKSPACE_BOUNDS
+        x_min, x_max = bounds['x']
+        y_min, y_max = bounds['y']
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        norm_ws_x = (robot_pos_2d[0] - x_min) / x_range if x_range > 0 else 0.5
+        norm_ws_y = (robot_pos_2d[1] - y_min) / y_range if y_range > 0 else 0.5
+
+        # Goal in body frame
+        goal_body_x = dist_to_goal * np.cos(angle_to_goal)
+        goal_body_y = dist_to_goal * np.sin(angle_to_goal)
+
         base_obs = np.array([
-            robot_pos_2d[0],           # [0] x
-            robot_pos_2d[1],           # [1] y
-            robot_heading,             # [2] theta
-            linear_velocity,           # [3] linear vel
-            angular_velocity,          # [4] angular vel
-            goal_pos_2d[0],            # [5] goal x
-            goal_pos_2d[1],            # [6] goal y
-            dist_to_goal,              # [7] distance
-            angle_to_goal,             # [8] angle to goal
+            norm_ws_x,                     # [0] normalized workspace x
+            norm_ws_y,                     # [1] normalized workspace y
+            np.sin(robot_heading),         # [2] sin(heading)
+            np.cos(robot_heading),         # [3] cos(heading)
+            linear_velocity,               # [4] linear vel
+            angular_velocity,              # [5] angular vel
+            goal_body_x,                   # [6] goal body-frame x
+            goal_body_y,                   # [7] goal body-frame y
+            dist_to_goal,                  # [8] distance to goal
             1.0 if goal_reached else 0.0,  # [9] goal reached flag
         ], dtype=np.float32)
 
@@ -1187,12 +1206,13 @@ class RewardComputer:
             return reward
 
         # Distance-based shaping (reward getting closer to goal)
-        prev_dist = obs[7]  # distance to goal
-        curr_dist = next_obs[7]
+        prev_dist = obs[8]  # distance to goal
+        curr_dist = next_obs[8]
         reward += (prev_dist - curr_dist) * self.DISTANCE_SCALE
 
         # Heading bonus (reward facing the goal)
-        angle_to_goal = abs(next_obs[8])  # angle to goal
+        # Derive angle_to_goal from body-frame goal: atan2(goal_body_y, goal_body_x)
+        angle_to_goal = abs(np.arctan2(next_obs[7], next_obs[6]))
         heading_bonus = (np.pi - angle_to_goal) / np.pi  # 1.0 when facing goal, 0.0 when facing away
         reward += heading_bonus * self.HEADING_BONUS_SCALE
 
@@ -1562,7 +1582,7 @@ class AutoPilot:
             return False
         return self._perpendicular_distance_to_segment(robot_x, robot_y) > self.replan_deviation
 
-    def compute_action(self, obs):
+    def compute_action(self, obs, robot_position=None, robot_heading=None):
         """Compute velocity command using pure-pursuit on A* path.
 
         Falls back to proportional control if no path is available.
@@ -1571,16 +1591,30 @@ class AutoPilot:
         Phase 2: Re-read target from (possibly updated) path for steering.
 
         Args:
-            obs: Observation vector (10D or 34D)
+            obs: Observation vector (10D or 34D, ego-centric layout)
+            robot_position: Optional [x, y] world position (for A* path following).
+                If not provided, path-based navigation is skipped and only
+                fallback proportional control is used.
+            robot_heading: Optional heading in radians (for A* path following).
 
         Returns:
             Tuple of (linear_vel, angular_vel) in physical units
         """
-        robot_x, robot_y = obs[0], obs[1]
-        heading = obs[2]
+        # Extract ego-centric features from obs
+        distance_to_goal = obs[8]
+        # Derive angle_to_goal from body-frame goal
+        angle_to_goal = atan2(float(obs[7]), float(obs[6]))
+
+        # Use explicit position/heading if provided, otherwise skip path-based nav
+        have_world_pose = robot_position is not None and robot_heading is not None
+        if have_world_pose:
+            robot_x, robot_y = float(robot_position[0]), float(robot_position[1])
+            heading = float(robot_heading)
+        else:
+            robot_x = robot_y = heading = None
 
         # --- Phase 1: waypoint advancement + replan check ---
-        if self._path and self._current_waypoint_idx < len(self._path):
+        if have_world_pose and self._path and self._current_waypoint_idx < len(self._path):
             # Advance waypoint index past those within lookahead
             advanced = False
             while self._current_waypoint_idx < len(self._path) - 1:
@@ -1603,7 +1637,7 @@ class AutoPilot:
                     self._path = []
 
         # --- Phase 2: steering from current path state ---
-        if self._path and self._current_waypoint_idx < len(self._path):
+        if have_world_pose and self._path and self._current_waypoint_idx < len(self._path):
             self._using_fallback = False
             target = self._path[self._current_waypoint_idx]
             dx = target[0] - robot_x
@@ -1628,19 +1662,16 @@ class AutoPilot:
             linear_vel = self.kp_linear * alignment + np.random.normal(0, self.noise_linear)
 
             # Slowdown near goal
-            distance_to_goal = obs[7]
             if distance_to_goal < 0.3:
                 linear_vel *= distance_to_goal / 0.3
 
         else:
-            # Fallback: proportional control toward goal
+            # Fallback: proportional control toward goal using ego-centric obs
             if not self._using_fallback:
                 self._using_fallback = True
                 self._fallback_triggered = True
-                self._fallback_origin = (float(robot_x), float(robot_y))
-
-            distance_to_goal = obs[7]
-            angle_to_goal = obs[8]
+                if have_world_pose:
+                    self._fallback_origin = (robot_x, robot_y)
 
             angular_vel = self.kp_angular * angle_to_goal + np.random.normal(0, self.noise_angular)
             alignment = max(0.0, 1.0 - abs(angle_to_goal) / (pi / 2))
@@ -2662,7 +2693,12 @@ class JetbotKeyboardController:
                         # Autopilot velocity computation
                         _skip_step = False
                         if self.automatic and self.auto_pilot is not None and self.current_obs is not None:
-                            linear_vel, angular_vel = self.auto_pilot.compute_action(self.current_obs)
+                            _ap_pos, _ap_heading = self._get_robot_pose()
+                            linear_vel, angular_vel = self.auto_pilot.compute_action(
+                                self.current_obs,
+                                robot_position=_ap_pos[:2],
+                                robot_heading=_ap_heading,
+                            )
                             self.current_linear_vel = linear_vel
                             self.current_angular_vel = angular_vel
 

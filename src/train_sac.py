@@ -38,6 +38,15 @@ def _get_tqc_quantile_critics(critic_module):
     return None
 
 
+def _is_crossq_model(model):
+    """Check if model is a CrossQ instance (uses BatchRenorm, no target networks)."""
+    try:
+        from sb3_contrib import CrossQ
+        return isinstance(model, CrossQ)
+    except ImportError:
+        return False
+
+
 class ChunkCVAEFeatureExtractor:
     """SB3 feature extractor for Chunk CVAE with split state/lidar MLPs.
 
@@ -61,15 +70,20 @@ class ChunkCVAEFeatureExtractor:
                 self._z_dim = z_dim
                 self._obs_feature_dim = features_dim - z_dim
 
+                # Dynamic split: state = obs[:obs_dim-24], lidar = obs[obs_dim-24:]
+                obs_dim = observation_space.shape[0]
+                self._state_dim = obs_dim - 24
+                self._lidar_dim = 24
+
                 self.state_mlp = nn.Sequential(
-                    nn.Linear(10, 64),
+                    nn.Linear(self._state_dim, 64),
                     nn.SiLU(),
                     nn.Linear(64, 32),
                     nn.SiLU(),
                 )
 
                 self.lidar_mlp = nn.Sequential(
-                    nn.Linear(24, 128),
+                    nn.Linear(self._lidar_dim, 128),
                     nn.SiLU(),
                     nn.Linear(128, 64),
                     nn.SiLU(),
@@ -81,8 +95,8 @@ class ChunkCVAEFeatureExtractor:
                 Returns:
                     obs_features tensor of shape (batch, 96)
                 """
-                state = symlog(observations[:, :10])
-                lidar = symlog(observations[:, 10:34])
+                state = symlog(observations[:, :self._state_dim])
+                lidar = symlog(observations[:, self._state_dim:])
                 state_features = self.state_mlp(state)
                 lidar_features = self.lidar_mlp(lidar)
                 return torch.cat([state_features, lidar_features], dim=-1)
@@ -130,17 +144,21 @@ class TemporalCVAEFeatureExtractor:
                 self._z_dim = z_dim
                 self._obs_feature_dim = gru_hidden_dim
                 self._n_frames = n_frames
-                self._per_frame_dim = 34
+                # Dynamic per-frame dim: total obs / n_frames
+                self._per_frame_dim = observation_space.shape[0] // n_frames
+                # Dynamic split: state = frame[:frame_dim-24], lidar = frame[frame_dim-24:]
+                self._state_dim = self._per_frame_dim - 24
+                self._lidar_dim = 24
 
                 self.state_mlp = nn.Sequential(
-                    nn.Linear(10, 64),
+                    nn.Linear(self._state_dim, 64),
                     nn.SiLU(),
                     nn.Linear(64, 32),
                     nn.SiLU(),
                 )
 
                 self.lidar_mlp = nn.Sequential(
-                    nn.Linear(24, 128),
+                    nn.Linear(self._lidar_dim, 128),
                     nn.SiLU(),
                     nn.Linear(128, 64),
                     nn.SiLU(),
@@ -157,20 +175,20 @@ class TemporalCVAEFeatureExtractor:
                 """Encode frame-stacked observations into obs_features via GRU.
 
                 Args:
-                    observations: (batch, n_frames * 34) tensor
+                    observations: (batch, n_frames * per_frame_dim) tensor
 
                 Returns:
                     obs_features tensor of shape (batch, gru_hidden_dim)
                 """
                 batch = observations.shape[0]
-                # Reshape to (batch, n_frames, 34)
+                # Reshape to (batch, n_frames, per_frame_dim)
                 x = observations.view(batch, self._n_frames, self._per_frame_dim)
 
                 # Per-frame MLP: process all frames at once
-                # Flatten to (batch * n_frames, 34) for MLP
+                # Flatten to (batch * n_frames, per_frame_dim) for MLP
                 x_flat = x.reshape(batch * self._n_frames, self._per_frame_dim)
-                state = symlog(x_flat[:, :10])
-                lidar = symlog(x_flat[:, 10:34])
+                state = symlog(x_flat[:, :self._state_dim])
+                lidar = symlog(x_flat[:, self._state_dim:])
                 state_features = self.state_mlp(state)   # (B*T, 32)
                 lidar_features = self.lidar_mlp(lidar)    # (B*T, 64)
                 frame_features = torch.cat([state_features, lidar_features], dim=-1)  # (B*T, 96)
@@ -353,8 +371,11 @@ def pretrain_chunk_cvae(model, demo_obs, demo_actions, episode_lengths,
     # Copy pretrained features_extractor weights → critic and critic_target
     fe_state = model.actor.features_extractor.state_dict()
     model.critic.features_extractor.load_state_dict(fe_state)
-    model.critic_target.features_extractor.load_state_dict(fe_state)
-    print("  Feature extractor weights copied to critic/critic_target")
+    if hasattr(model, 'critic_target') and model.critic_target is not None:
+        model.critic_target.features_extractor.load_state_dict(fe_state)
+        print("  Feature extractor weights copied to critic/critic_target")
+    else:
+        print("  Feature extractor weights copied to critic (no target network)")
 
     # Tighten log_std to preserve CVAE-learned behavior
     model.actor.log_std.weight.data.zero_()
@@ -447,7 +468,13 @@ def inject_layernorm_into_critics(model):
 
     Handles both TQC (quantile_critics) and SAC (critic.qf*) structures.
     After injection, re-syncs critic_target and recreates the critic optimizer.
+
+    Skipped for CrossQ models (BatchRenorm is built into the critic architecture).
     """
+    if _is_crossq_model(model):
+        print("CrossQ detected — skipping LayerNorm injection (BatchRenorm built-in)")
+        return
+
     import torch
     import torch.nn as nn
 
@@ -827,12 +854,14 @@ def _create_safe_tqc_class(tqc_base_cls):
                     next_log_prob = next_log_prob.reshape(-1, 1)
 
                     # Compute target Q-values
-                    _qc_target = _get_tqc_quantile_critics(self.critic_target)
+                    # CrossQ has no target network — use critic directly
+                    _critic_for_target = getattr(self, 'critic_target', None) or self.critic
+                    _qc_target = _get_tqc_quantile_critics(_critic_for_target)
                     if _qc_target is not None:
                         # TQC: iterate quantile critics, sort & drop top quantiles
                         next_quantiles = []
                         for critic_net in _qc_target:
-                            features = self.critic_target.features_extractor(
+                            features = _critic_for_target.features_extractor(
                                 replay_data.next_observations
                             )
                             x = torch.cat([features, next_actions], dim=-1)
@@ -847,8 +876,8 @@ def _create_safe_tqc_class(tqc_base_cls):
                             sorted_q = sorted_q[:, :n_target_quantiles]
                         next_q = sorted_q.mean(dim=1, keepdim=True)
                     else:
-                        # SAC: use critic forward, min of Q-values
-                        next_q_values = self.critic_target(
+                        # SAC/CrossQ: use critic forward, min of Q-values
+                        next_q_values = _critic_for_target(
                             replay_data.next_observations, next_actions
                         )
                         if isinstance(next_q_values, (list, tuple)):
@@ -1012,16 +1041,21 @@ def _create_safe_tqc_class(tqc_base_cls):
                     lagrange_values.append(F.softplus(self.log_lagrange).item())
 
                 # --- Target network update ---
-                polyak_update(
-                    self.critic.parameters(),
-                    self.critic_target.parameters(),
-                    self.tau
-                )
+                # CrossQ has no reward critic target; TQC/SAC need polyak
+                if hasattr(self, 'critic_target') and self.critic_target is not None:
+                    _cost_tau = getattr(self, '_cost_tau', self.tau)
+                    polyak_update(
+                        self.critic.parameters(),
+                        self.critic_target.parameters(),
+                        self.tau
+                    )
+                else:
+                    _cost_tau = 0.005  # default for cost critic when base has no tau
                 if cost_data is not None:
                     polyak_update(
                         self.cost_critic.parameters(),
                         self.cost_critic_target.parameters(),
-                        self.tau
+                        _cost_tau
                     )
 
             # Logging
@@ -1219,10 +1253,11 @@ def _create_dual_policy_class(base_cls):
                         next_obs, deterministic=True
                     )
 
-                    _qc_target = _get_tqc_quantile_critics(self.critic_target)
+                    _critic_for_target = getattr(self, 'critic_target', None) or self.critic
+                    _qc_target = _get_tqc_quantile_critics(_critic_for_target)
                     if _qc_target is not None:
                         # TQC quantile path: compute features once, reuse
-                        feats = self.critic_target.features_extractor(next_obs)
+                        feats = _critic_for_target.features_extractor(next_obs)
                         x_rl = torch.cat([feats, next_actions_rl], dim=-1)
                         x_il = torch.cat([feats, next_actions_il], dim=-1)
 
@@ -1264,9 +1299,9 @@ def _create_dual_policy_class(base_cls):
                         next_q = sorted_q.mean(dim=1, keepdim=True)
 
                     else:
-                        # SAC scalar path
-                        next_q_rl = self.critic_target(next_obs, next_actions_rl)
-                        next_q_il = self.critic_target(next_obs, next_actions_il)
+                        # SAC/CrossQ scalar path
+                        next_q_rl = _critic_for_target(next_obs, next_actions_rl)
+                        next_q_il = _critic_for_target(next_obs, next_actions_il)
 
                         def _min_q(q_raw):
                             if isinstance(q_raw, (list, tuple)):
@@ -1398,11 +1433,12 @@ def _create_dual_policy_class(base_cls):
                 self.actor.optimizer.step()
 
                 # --- Target network update ---
-                polyak_update(
-                    self.critic.parameters(),
-                    self.critic_target.parameters(),
-                    self.tau,
-                )
+                if hasattr(self, 'critic_target') and self.critic_target is not None:
+                    polyak_update(
+                        self.critic.parameters(),
+                        self.critic_target.parameters(),
+                        self.tau,
+                    )
 
             # Logging
             self._n_updates += gradient_steps
@@ -1496,8 +1532,8 @@ Examples:
                         help='Total training timesteps (default: 500000)')
     parser.add_argument('--demos', type=str, required=True,
                         help='Path to demo .npz file (required)')
-    parser.add_argument('--utd-ratio', type=int, default=20,
-                        help='Update-to-data ratio / gradient steps per env step (default: 20)')
+    parser.add_argument('--utd-ratio', type=int, default=1,
+                        help='Update-to-data ratio / gradient steps per env step (default: 1)')
     parser.add_argument('--buffer-size', type=int, default=300000,
                         help='Replay buffer size (default: 300000)')
     parser.add_argument('--batch-size', type=int, default=256,
@@ -1508,6 +1544,10 @@ Examples:
                         help='Discount factor (default: 0.99)')
     parser.add_argument('--tau', type=float, default=0.005,
                         help='Soft update coefficient (default: 0.005)')
+    parser.add_argument('--legacy-tqc', action='store_true',
+                        help='Use TQC instead of CrossQ (legacy mode)')
+    parser.add_argument('--policy-delay', type=int, default=1,
+                        help='Actor update delay (default: 1; CrossQ paper uses 20 with UTD=20)')
     parser.add_argument('--ent-coef', type=str, default='auto_0.006',
                         help='Entropy coefficient, "auto" or "auto_<init>" for learned (default: auto_0.006)')
     parser.add_argument('--seed', type=int, default=42,
@@ -1552,6 +1592,8 @@ Examples:
                         help='Minimum distance from robot start to goal in meters (default: 0.5)')
     parser.add_argument('--inflation-radius', type=float, default=0.08,
                         help='Obstacle inflation radius for A* planner in meters (default: 0.08)')
+    parser.add_argument('--add-prev-action', action='store_true',
+                        help='Add previous action to observations (34D → 36D)')
 
     # Checkpoint arguments
     parser.add_argument('--checkpoint-freq', type=int, default=50000,
@@ -1564,7 +1606,7 @@ Examples:
                         help='Print per-episode stats')
 
     # Output arguments
-    parser.add_argument('--output', type=str, default='models/tqc_jetbot.zip',
+    parser.add_argument('--output', type=str, default='models/crossq_jetbot.zip',
                         help='Output model path (default: models/tqc_jetbot.zip)')
     parser.add_argument('--tensorboard-log', type=str, default='./runs/',
                         help='TensorBoard log directory (default: ./runs/)')
@@ -1665,16 +1707,33 @@ Examples:
     from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
     from demo_utils import make_chunk_transitions
 
-    # Try TQC first, fall back to SAC
-    try:
-        from sb3_contrib import TQC
-        algo_cls = TQC
-        algo_name = "TQC"
-    except ImportError:
-        from stable_baselines3 import SAC
-        algo_cls = SAC
-        algo_name = "SAC"
-        print("sb3-contrib not found, falling back to SAC")
+    # Algorithm selection: CrossQ (default) > TQC (--legacy-tqc) > SAC (fallback)
+    if args.legacy_tqc:
+        try:
+            from sb3_contrib import TQC
+            algo_cls = TQC
+            algo_name = "TQC"
+        except ImportError:
+            from stable_baselines3 import SAC
+            algo_cls = SAC
+            algo_name = "SAC"
+            print("sb3-contrib not found, falling back to SAC")
+    else:
+        try:
+            from sb3_contrib import CrossQ
+            algo_cls = CrossQ
+            algo_name = "CrossQ"
+        except ImportError:
+            try:
+                from sb3_contrib import TQC
+                algo_cls = TQC
+                algo_name = "TQC"
+                print("CrossQ not available, falling back to TQC")
+            except ImportError:
+                from stable_baselines3 import SAC
+                algo_cls = SAC
+                algo_name = "SAC"
+                print("sb3-contrib not found, falling back to SAC")
 
     # Mutual exclusion
     if args.dual_policy and args.safe:
@@ -1711,10 +1770,12 @@ Examples:
         inflation_radius=args.inflation_radius,
         cost_type=getattr(args, 'cost_type', 'proximity'),
         safe_mode=safe_mode,
+        add_prev_action=getattr(args, 'add_prev_action', False),
     )
     if args.n_frames > 1:
+        base_obs_dim = raw_env.observation_space.shape[0]
         raw_env = FrameStackWrapper(raw_env, n_frames=args.n_frames)
-        print(f"  FrameStackWrapper: n_frames={args.n_frames}, obs {34} → {raw_env.observation_space.shape[0]}")
+        print(f"  FrameStackWrapper: n_frames={args.n_frames}, obs {base_obs_dim} → {raw_env.observation_space.shape[0]}")
     raw_env = ChunkedEnvWrapper(raw_env, chunk_size=args.chunk_size, gamma=args.gamma)
     print(f"  Environment created in {_time.time() - _t0:.1f}s")
     print(f"  Observation space: {raw_env.observation_space.shape}")
@@ -1826,7 +1887,8 @@ Examples:
         model.learning_rate = args.lr
         model.batch_size = args.batch_size
         model.gamma = effective_gamma
-        model.tau = args.tau
+        if not _is_crossq_model(model):
+            model.tau = args.tau
         model.gradient_steps = args.utd_ratio
         model.ent_coef = ent_coef
         # Replace replay buffer with fresh demo buffer (online data is lost)
@@ -1851,6 +1913,7 @@ Examples:
             features_extractor_class=fe_cls,
             features_extractor_kwargs=dict(features_dim=features_dim),
         )
+        is_crossq = (algo_name == "CrossQ" or algo_name.endswith("CrossQ"))
         if "TQC" in algo_name:
             policy_kwargs['n_critics'] = 5
 
@@ -1863,7 +1926,6 @@ Examples:
             buffer_size=args.buffer_size,
             batch_size=args.batch_size,
             gamma=effective_gamma,
-            tau=args.tau,
             ent_coef=ent_coef,
             target_entropy=-2.0,
             gradient_steps=args.utd_ratio,
@@ -1871,6 +1933,12 @@ Examples:
             train_freq=1,
             policy_kwargs=policy_kwargs,
         )
+        # CrossQ has no target networks (tau is internal); TQC/SAC need tau for polyak
+        if not is_crossq:
+            model_kwargs['tau'] = args.tau
+        # CrossQ supports policy_delay natively
+        if is_crossq and args.policy_delay > 1:
+            model_kwargs['policy_delay'] = args.policy_delay
         if args.safe:
             model_kwargs.update(dict(
                 cost_limit=args.cost_limit,
@@ -1934,11 +2002,14 @@ Examples:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     if "Safe" in algo_name:
-        prefix = "safe_tqc_jetbot" if "TQC" in algo_name else "safe_sac_jetbot"
+        base = "tqc" if "TQC" in algo_name else ("crossq" if "CrossQ" in algo_name else "sac")
+        prefix = f"safe_{base}_jetbot"
     elif "DualPolicy" in algo_name:
-        prefix = "dual_tqc_jetbot" if "TQC" in algo_name else "dual_sac_jetbot"
+        base = "tqc" if "TQC" in algo_name else ("crossq" if "CrossQ" in algo_name else "sac")
+        prefix = f"dual_{base}_jetbot"
     else:
-        prefix = "tqc_jetbot" if algo_name == "TQC" else "sac_jetbot"
+        prefix = {"TQC": "tqc_jetbot", "CrossQ": "crossq_jetbot", "SAC": "sac_jetbot"}.get(
+            algo_name, "sac_jetbot")
     checkpoint_callback = CheckpointCallback(
         save_freq=args.checkpoint_freq,
         save_path=str(checkpoint_dir),

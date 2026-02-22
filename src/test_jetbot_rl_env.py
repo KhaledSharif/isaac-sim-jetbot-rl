@@ -169,11 +169,12 @@ class TestRewardComputation:
 
         # Create observations where robot gets closer to goal
         prev_obs = np.zeros(10)
-        prev_obs[7] = 2.0  # Distance to goal
+        prev_obs[8] = 2.0  # Distance to goal
 
         next_obs = np.zeros(10)
-        next_obs[7] = 1.0  # Closer to goal
-        next_obs[8] = 0.0  # Facing goal
+        next_obs[8] = 1.0  # Closer to goal
+        next_obs[6] = 1.0  # goal_body_x (facing goal, angle=0)
+        next_obs[7] = 0.0  # goal_body_y
 
         reward = computer.compute(
             obs=prev_obs,
@@ -192,11 +193,12 @@ class TestRewardComputation:
 
         # Create observations where robot gets farther from goal
         prev_obs = np.zeros(10)
-        prev_obs[7] = 1.0  # Distance to goal
+        prev_obs[8] = 1.0   # Distance to goal
 
         next_obs = np.zeros(10)
-        next_obs[7] = 2.0  # Farther from goal
-        next_obs[8] = np.pi  # Facing away from goal
+        next_obs[8] = 2.0   # Farther from goal
+        next_obs[6] = -2.0  # goal_body_x = dist*cos(pi) = -2.0
+        next_obs[7] = 0.0   # goal_body_y = dist*sin(pi) ≈ 0
 
         reward = computer.compute(
             obs=prev_obs,
@@ -609,6 +611,8 @@ class TestBuildObservation:
             env.obs_builder = ObservationBuilder(lidar_sensor=env.lidar_sensor)
             env._current_linear_vel = 0.0
             env._current_angular_vel = 0.0
+            env.add_prev_action = False
+            env._prev_action = np.zeros(2, dtype=np.float32)
 
             # Mock scene_manager and _get_robot_pose
             env.scene_manager = Mock()
@@ -662,9 +666,11 @@ class TestStep:
             env.reward_computer = RewardComputer(mode='dense')
             env._step_count = 0
             env._prev_obs = np.zeros(34, dtype=np.float32)
-            env._prev_obs[7] = 2.0  # distance to goal
+            env._prev_obs[8] = 2.0  # distance to goal
             env._current_linear_vel = 0.0
             env._current_angular_vel = 0.0
+            env.add_prev_action = False
+            env._prev_action = np.zeros(2, dtype=np.float32)
 
             env.MAX_LINEAR_VELOCITY = 0.3
             env.MAX_ANGULAR_VELOCITY = 1.0
@@ -736,6 +742,8 @@ class TestReset:
             env._prev_obs = None
             env._current_linear_vel = 0.5
             env._current_angular_vel = 0.5
+            env.add_prev_action = False
+            env._prev_action = np.zeros(2, dtype=np.float32)
 
             env.START_POSITION = np.array([0.0, 0.0, 0.05])
 

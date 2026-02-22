@@ -10,8 +10,10 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 - **Random Obstacles**: Configurable static obstacles for navigation challenge
 - **Demonstration Recording**: Record navigation trajectories to HDF5 (incremental O(delta) checkpoints) or NPZ
 - **Automatic Demo Collection**: Autonomous A*-based data collection with collision-free expert controller
-- **RL Training Pipeline**: PPO with BC warmstart; SAC/TQC with Chunk CVAE + Q-Chunking
+- **RL Training Pipeline**: PPO with BC warmstart; CrossQ/TQC/SAC with Chunk CVAE + Q-Chunking
+- **CrossQ (Default)**: BatchRenorm critics, no target networks, UTD=1 — ~13x faster than TQC@UTD=20
 - **SafeTQC**: Constrained RL with dual cost critic + learned Lagrange multiplier for obstacle avoidance
+- **Ego-Centric Observations**: Normalized workspace coords, sin/cos heading, body-frame goal — improves generalization
 - **Action Chunking**: k-step action chunks reduce compounding errors from single-step BC
 - **Chunk CVAE**: Conditional VAE pretraining handles multimodal demonstrations
 - **Q-Chunking**: Critic evaluates chunk-level Q-values via `ChunkedEnvWrapper`
@@ -28,7 +30,7 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 ### Python Dependencies
 
 ```bash
-~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 tensorboard gymnasium
+~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 sb3-contrib tensorboard gymnasium
 ```
 
 ### HDF5 Demo Recording (Recommended)
@@ -74,11 +76,14 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
 ./run.sh --num-obstacles 10
 ```
 
-### Train RL Agent (SAC/TQC + Chunk CVAE)
+### Train RL Agent (CrossQ + Chunk CVAE)
 
 ```bash
 # Both .npz and .hdf5 demo files are accepted
 ./run.sh train_sac.py --demos demos/recording.hdf5 --headless --timesteps 500000
+
+# Legacy TQC mode (slower but proven)
+./run.sh train_sac.py --demos demos/recording.hdf5 --headless --legacy-tqc --utd-ratio 20
 
 # With SafeTQC (constrained RL)
 ./run.sh train_sac.py --demos demos/recording.hdf5 --headless --safe
@@ -118,8 +123,8 @@ isaac-sim-jetbot-keyboard/
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment
 │   ├── train_rl.py                   # PPO training script
-│   ├── train_sac.py                  # SAC/TQC + RLPD training script
-│   ├── eval_policy.py                # Policy evaluation (auto-detects TQC/SAC/PPO)
+│   ├── train_sac.py                  # CrossQ/TQC/SAC + RLPD training script
+│   ├── eval_policy.py                # Policy evaluation (auto-detects CrossQ/TQC/SAC/PPO)
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py
@@ -182,15 +187,18 @@ isaac-sim-jetbot-keyboard/
 ### Training
 
 ```bash
-# SAC/TQC + Chunk CVAE + Q-Chunking (recommended)
+# CrossQ + Chunk CVAE + Q-Chunking (recommended, ~35-39 steps/s)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000
+
+# Legacy TQC mode (slower but proven, ~2.9 steps/s at UTD=20)
+./run.sh train_sac.py --demos demos/recording.npz --headless --legacy-tqc --utd-ratio 20
 
 # Custom chunk size and UTD ratio
 ./run.sh train_sac.py --demos demos/recording.npz --headless --chunk-size 5 --utd-ratio 5
 
-# SAC/TQC with obstacles and arena config
+# With obstacles and arena config
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 1000000 \
-  --num-obstacles 50 --arena-size 8 --max-steps 1000 --utd-ratio 5
+  --num-obstacles 50 --arena-size 8 --max-steps 1000
 
 # Custom CVAE hyperparameters
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
@@ -198,7 +206,7 @@ isaac-sim-jetbot-keyboard/
 
 # Resume training from checkpoint
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
-  --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
+  --resume models/checkpoints/crossq_jetbot_50000_steps.zip --timesteps 500000
 
 # SafeTQC: constrained RL with cost critic + Lagrange multiplier
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe
@@ -217,9 +225,11 @@ isaac-sim-jetbot-keyboard/
 ./run.sh train_bc.py demos/recording.npz --epochs 100
 ```
 
-#### SAC/TQC + Chunk CVAE + Q-Chunking Pipeline (Recommended)
+#### CrossQ + Chunk CVAE + Q-Chunking Pipeline (Recommended)
 
-The `train_sac.py` script uses TQC (Truncated Quantile Critics) with action chunking and RLPD-style 50/50 demo/online replay buffer sampling. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking). LayerNorm in critics replaces VecNormalize.
+The `train_sac.py` script uses **CrossQ** (BatchRenorm critics, no target networks) by default with action chunking and RLPD-style 50/50 demo/online replay buffer sampling. CrossQ achieves equal sample efficiency to TQC@UTD=20 at UTD=1, providing a ~13x speedup. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking).
+
+Use `--legacy-tqc` to switch to TQC (Truncated Quantile Critics) with UTD=20 for backward compatibility.
 
 **Architecture:**
 ```
@@ -229,33 +239,36 @@ ChunkedEnvWrapper: action_space (2,) → (k*2,), executes k sub-steps per wrappe
 Actor:  obs(34D) → ChunkCVAEFeatureExtractor → (obs_features || z=0) → latent_pi → mu → tanh → (k*2)
 Critic: Q(obs_features || z=0, action_chunk) → scalar
 
-ChunkCVAEFeatureExtractor:
-  34D obs → split → [state 0:10]  → symlog → MLP(10→64→32)  →  32D ┐
-                     [lidar 10:34] → symlog → MLP(24→128→64)  →  64D ├→ concat → 96D + z_pad(8D) = 104D
+ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
+  obs → split → [state 0:state_dim]       → symlog → MLP(state_dim→64→32) → 32D ┐
+                 [lidar state_dim:obs_dim] → symlog → MLP(24→128→64)       → 64D ├→ concat → 96D + z_pad(8D) = 104D
 ```
 
 **Pipeline order:**
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
 2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
 3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-2.0
-4. Inject LayerNorm into critics
+4. Inject LayerNorm into critics (skipped for CrossQ — BatchRenorm built-in)
 5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
-6. Copy pretrained feature extractor weights → critic/critic_target
-7. Train with SAC/TQC (CVAE encoder discarded, z-slot zeroed during RL)
+6. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
+7. Train with CrossQ/TQC/SAC (CVAE encoder discarded, z-slot zeroed during RL)
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--chunk-size` | 10 | Action chunk size (k) |
+| `--legacy-tqc` | off | Use TQC instead of CrossQ (legacy mode) |
+| `--utd-ratio` | 1 | Gradient steps per env step (CrossQ=1, TQC=20) |
+| `--policy-delay` | 1 | Actor update delay (for CrossQ with high UTD) |
+| `--add-prev-action` | off | Include previous action in observations (36D) |
 | `--cvae-z-dim` | 8 | CVAE latent dimension |
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
-| `--utd-ratio` | 20 | Gradient steps per env step |
 | `--demo-ratio` | 0.5 | Fraction of batch from demos |
 
 #### SafeTQC: Constrained RL with Lagrange Multiplier
 
-When `--safe` is enabled, `train_sac.py` adds a **cost critic** and **learned Lagrange multiplier** on top of the standard TQC pipeline. This replaces the hand-tuned proximity penalty in the reward function with a principled constrained optimization approach.
+When `--safe` is enabled, `train_sac.py` adds a **cost critic** and **learned Lagrange multiplier** on top of the standard CrossQ/TQC pipeline. This replaces the hand-tuned proximity penalty in the reward function with a principled constrained optimization approach.
 
 **How it works:**
 - A separate cost critic estimates cumulative obstacle violation costs (binary: 1.0 if min LiDAR < 0.3m, else 0.0)
@@ -291,17 +304,17 @@ The VecNormalize pre-warming step is critical: without it, the BC-learned policy
 ### Evaluation
 
 ```bash
-# Evaluate trained policy (auto-detects TQC/SAC/PPO and chunk size)
-./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100
+# Evaluate trained policy (auto-detects CrossQ/TQC/SAC/PPO and chunk size)
+./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100
 
 # Headless evaluation
-./run.sh eval_policy.py models/tqc_jetbot.zip --headless --episodes 100
+./run.sh eval_policy.py models/crossq_jetbot.zip --headless --episodes 100
 
 # Evaluation with cost tracking (for SafeTQC models)
-./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100 --safe --cost-type proximity
+./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100 --safe --cost-type proximity
 
 # Override chunk size or inflation radius
-./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
+./run.sh eval_policy.py models/crossq_jetbot.zip --chunk-size 5 --inflation-radius 0.08
 ```
 
 ### Demo File Format
@@ -345,22 +358,28 @@ python src/demo_io.py demos/recording.npz
 ./run_tests.sh -k test_action_mapper
 ```
 
-## Observation Space (34D for RL, 10D base for teleoperation)
+## Observation Space (34D ego-centric for RL, 10D base for teleoperation)
 
 | Index | Description | Range |
 |-------|-------------|-------|
-| 0-1 | Robot position (x, y) | meters |
-| 2 | Robot heading (theta) | radians |
-| 3 | Linear velocity | m/s |
-| 4 | Angular velocity | rad/s |
-| 5-6 | Goal position (x, y) | meters |
-| 7 | Distance to goal | meters |
-| 8 | Angle to goal | radians |
+| 0 | Normalized workspace X | [0, 1] |
+| 1 | Normalized workspace Y | [0, 1] |
+| 2 | sin(heading) | [-1, 1] |
+| 3 | cos(heading) | [-1, 1] |
+| 4 | Linear velocity | m/s |
+| 5 | Angular velocity | rad/s |
+| 6 | Goal body-frame X (dist * cos(angle)) | meters |
+| 7 | Goal body-frame Y (dist * sin(angle)) | meters |
+| 8 | Distance to goal | meters |
 | 9 | Goal reached flag | 0 or 1 |
 | 10-33 | LiDAR distances (24 rays, 180 FOV) | 0.0 (touching) to 1.0 (max range) |
 
-The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR.
+With `--add-prev-action` (36D): inserts `[prev_linear_vel, prev_angular_vel]` at indices [10:12], pushing LiDAR to [12:36].
+
+The RL environment (`JetbotNavigationEnv`) always uses 34D ego-centric observations with LiDAR.
 The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
+
+Old demos (pre-OBS_VERSION=2) are auto-converted to the new ego-centric format on load.
 
 ## Action Space (2D)
 
@@ -394,17 +413,17 @@ tensorboard --logdir runs/
 
 ## Training Performance
 
-The dominant cost in SAC/TQC training is **gradient computation**, not physics simulation. Each env step takes ~25ms (`world.step()`), but TQC's 5 critic networks + actor require significant GPU time per gradient update.
+CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at UTD=1 via BatchRenorm in critics and no target networks, providing a ~13x speedup:
 
-| UTD Ratio | Steps/s | 1M Steps Wall Time | Sample Efficiency |
-|-----------|---------|---------------------|-------------------|
-| 20 (default) | ~3 | ~4 days | Best |
-| 5 | ~10-12 | ~24 hours | Good |
-| 1 | ~39 | ~7 hours | Lower |
+| Algorithm | UTD | Steps/s | 1M Steps Wall Time | Speedup |
+|-----------|-----|---------|---------------------|---------|
+| TQC       | 20  | ~3      | ~4 days             | 1x      |
+| TQC       | 5   | ~10-12  | ~24 hours           | ~4x     |
+| **CrossQ**| **1** | **~35-39** | **~7 hours**    | **~13x** |
 
 *Measured on RTX 3090 Ti, 50 obstacles, headless, batch size 256.*
 
-**Recommendation:** `--utd-ratio 5` gives a good balance of speed and sample efficiency. Use `--utd-ratio 20` only if you can afford multi-day runs.
+**Recommendation:** Use CrossQ (default) for fast training. Use `--legacy-tqc --utd-ratio 20` only if you need exact TQC reproduction.
 
 Additional optimizations applied in headless mode:
 - Obstacles use `Visual*` primitives (no PhysX collision — LiDAR is analytical)
@@ -418,12 +437,12 @@ Additional optimizations applied in headless mode:
 - **JetbotKeyboardController**: Main application with keyboard input and Rich TUI
 - **JetbotNavigationEnv**: Gymnasium-compatible RL environment with A* solvability checks on reset
 - **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking
-- **ChunkCVAEFeatureExtractor**: Split state/lidar MLPs + z-pad slot for CVAE latent variable
+- **ChunkCVAEFeatureExtractor**: Dynamic split state/lidar MLPs + z-pad slot for CVAE latent variable (supports 34D and 36D obs)
 - **DifferentialController**: Converts velocity commands to wheel speeds
 - **SceneManager**: Manages goal markers, obstacles, and scene objects
 - **DemoRecorder/DemoPlayer**: Recording and playback of demonstrations; HDF5 incremental writes by default (with cost data for SafeTQC)
 - **demo_io**: Unified demo I/O — `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) appends
-- **SafeTQC**: TQC subclass with cost critic + Lagrange multiplier for constrained RL
+- **SafeTQC**: CrossQ/TQC subclass with cost critic + Lagrange multiplier for constrained RL
 - **CostReplayBuffer**: Parallel cost buffer mirroring the main replay buffer
 - **MeanCostCritic**: Twin-Q cost critic with independent feature extractor
 - **CameraStreamer**: GStreamer H264 RTP UDP camera streaming

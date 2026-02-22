@@ -81,6 +81,8 @@ Examples:
     parser.add_argument('--cost-type', choices=['proximity', 'collision', 'both'],
                         default='proximity',
                         help='Cost signal type for evaluation (default: proximity)')
+    parser.add_argument('--add-prev-action', action='store_true',
+                        help='Include previous action in observations (36D instead of 34D)')
 
     args = parser.parse_args()
 
@@ -113,7 +115,11 @@ Examples:
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-    # Try importing TQC from sb3-contrib
+    # Try importing TQC and CrossQ from sb3-contrib
+    try:
+        from sb3_contrib import CrossQ
+    except ImportError:
+        CrossQ = None
     try:
         from sb3_contrib import TQC
     except ImportError:
@@ -121,11 +127,15 @@ Examples:
 
     # Create environment
     print("Creating environment...")
+    # Auto-detect add_prev_action from model obs dim if not explicitly set
+    add_prev_action = getattr(args, 'add_prev_action', False)
+
     raw_env = JetbotNavigationEnv(
         reward_mode=args.reward_mode,
         headless=args.headless,
         inflation_radius=args.inflation_radius,
         cost_type=args.cost_type,
+        add_prev_action=add_prev_action,
     )
     print(f"  Observation space: {raw_env.observation_space.shape}")
     print(f"  Action space (inner): {raw_env.action_space.shape}")
@@ -155,7 +165,7 @@ Examples:
     print(f"Loading policy from {args.policy_path}...")
     model = None
     algo_used = None
-    for algo_cls, name in [(TQC, "TQC"), (SAC, "SAC"), (PPO, "PPO")]:
+    for algo_cls, name in [(CrossQ, "CrossQ"), (TQC, "TQC"), (SAC, "SAC"), (PPO, "PPO")]:
         if algo_cls is None:
             continue
         try:
@@ -180,8 +190,10 @@ Examples:
     model_obs_dim = model.observation_space.shape[0]
     n_frames = args.n_frames
     if n_frames is None and model_obs_dim > 34:
-        n_frames = model_obs_dim // 34
-        print(f"  Auto-detected n_frames={n_frames} from model obs_dim={model_obs_dim}")
+        # base_obs_dim is 34 (standard) or 36 (with prev-action)
+        base_obs_dim = 36 if (model_obs_dim % 36 == 0 and model_obs_dim % 34 != 0) else 34
+        n_frames = model_obs_dim // base_obs_dim
+        print(f"  Auto-detected n_frames={n_frames} from model obs_dim={model_obs_dim} (base={base_obs_dim})")
 
     # Wrap env with FrameStackWrapper if frame-stacked model
     if n_frames is not None and n_frames > 1:

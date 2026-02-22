@@ -6,6 +6,9 @@ jetbot_keyboard_control.py, jetbot_rl_env.py, and replay.py.
 
 import numpy as np
 
+# Observation layout version (2 = ego-centric obs)
+OBS_VERSION = 2
+
 # Jetbot physical parameters
 WHEEL_RADIUS = 0.03      # meters
 WHEEL_BASE = 0.1125      # meters (distance between wheels)

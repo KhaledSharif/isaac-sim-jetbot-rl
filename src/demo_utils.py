@@ -7,6 +7,49 @@ import numpy as np
 from demo_io import open_demo
 
 
+def convert_obs_to_egocentric(obs_array, workspace_bounds):
+    """Vectorized conversion from old (v1) 34D obs to new ego-centric (v2) 34D obs.
+
+    Old layout: [x, y, heading, lin_vel, ang_vel, goal_x, goal_y, dist, angle_to_goal, reached, lidar...]
+    New layout: [norm_ws_x, norm_ws_y, sin(h), cos(h), lin_vel, ang_vel, goal_body_x, goal_body_y, dist, reached, lidar...]
+
+    Args:
+        obs_array: numpy (N, 34) old-format observations
+        workspace_bounds: dict with 'x' and 'y' keys, each [min, max]
+
+    Returns:
+        numpy (N, 34) ego-centric observations
+    """
+    out = obs_array.copy()
+    x_min, x_max = workspace_bounds['x']
+    y_min, y_max = workspace_bounds['y']
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+
+    # Old indices
+    robot_x = obs_array[:, 0]
+    robot_y = obs_array[:, 1]
+    heading = obs_array[:, 2]
+    # lin_vel (3), ang_vel (4) stay at same relative position in the base obs
+    dist = obs_array[:, 7]
+    angle_to_goal = obs_array[:, 8]
+
+    # New features
+    out[:, 0] = (robot_x - x_min) / x_range if x_range > 0 else 0.5
+    out[:, 1] = (robot_y - y_min) / y_range if y_range > 0 else 0.5
+    out[:, 2] = np.sin(heading)
+    out[:, 3] = np.cos(heading)
+    out[:, 4] = obs_array[:, 3]  # lin_vel
+    out[:, 5] = obs_array[:, 4]  # ang_vel
+    out[:, 6] = dist * np.cos(angle_to_goal)  # goal_body_x
+    out[:, 7] = dist * np.sin(angle_to_goal)  # goal_body_y
+    out[:, 8] = dist
+    out[:, 9] = obs_array[:, 9]  # reached
+    # LiDAR [10:34] stays the same
+
+    return out.astype(np.float32)
+
+
 def validate_demo_data(filepath: str, require_cost: bool = False) -> dict:
     """Validate demonstration data meets minimum requirements for training.
 
@@ -141,12 +184,24 @@ def load_demo_transitions(npz_path: str, load_costs: bool = False):
         5-tuple of (obs, actions, rewards, next_obs, dones) numpy arrays, or
         6-tuple adding costs when load_costs=True
     """
+    from jetbot_config import DEFAULT_WORKSPACE_BOUNDS, OBS_VERSION
+
     data = open_demo(npz_path)
     observations = data['observations'].astype(np.float32)
     actions = data['actions'].astype(np.float32)
     rewards = data['rewards'].astype(np.float32)
     episode_lengths = data['episode_lengths']
     raw_dones = data['dones'].astype(np.float32) if 'dones' in data else np.zeros(len(observations), dtype=np.float32)
+
+    # Auto-convert old v1 observations to ego-centric v2 format
+    metadata = data['metadata'].item() if 'metadata' in data else {}
+    if isinstance(metadata, dict):
+        demo_obs_version = metadata.get('obs_version', 1)
+    else:
+        demo_obs_version = 1
+    if demo_obs_version < OBS_VERSION and observations.shape[1] >= 10:
+        print(f"  Auto-converting demo obs from v{demo_obs_version} to v{OBS_VERSION} (ego-centric)")
+        observations = convert_obs_to_egocentric(observations, DEFAULT_WORKSPACE_BOUNDS)
 
     total = len(observations)
     next_obs = np.zeros_like(observations)
@@ -432,12 +487,14 @@ class VerboseEpisodeCallback:
                         new_obs = self.locals.get('new_obs')
                         if new_obs is not None:
                             obs = new_obs[i] if len(new_obs) > i else new_obs[0]
-                            goal_x, goal_y = obs[5], obs[6]
-                            dist = obs[7]
-                            heading_deg = float(np.degrees(obs[2]))
+                            # Ego-centric: goal_body_x=[6], goal_body_y=[7], dist=[8]
+                            goal_body_x, goal_body_y = obs[6], obs[7]
+                            dist = obs[8]
+                            # Derive heading from sin/cos: obs[2]=sin(h), obs[3]=cos(h)
+                            heading_deg = float(np.degrees(np.arctan2(obs[2], obs[3])))
                             print(
                                 f"[EP {self._ep_count + 1:4d} START] "
-                                f"goal=({goal_x:+.2f}, {goal_y:+.2f}) | "
+                                f"goal_body=({goal_body_x:+.2f}, {goal_body_y:+.2f}) | "
                                 f"dist={dist:.2f}m | "
                                 f"heading={heading_deg:+.1f}deg",
                                 flush=True

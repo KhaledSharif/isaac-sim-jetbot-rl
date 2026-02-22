@@ -15,7 +15,7 @@ import time
 from jetbot_config import (
     WHEEL_RADIUS, WHEEL_BASE,
     MAX_LINEAR_VELOCITY, MAX_ANGULAR_VELOCITY,
-    START_POSITION,
+    START_POSITION, DEFAULT_WORKSPACE_BOUNDS,
 )
 
 
@@ -136,8 +136,13 @@ def visual_playback(filepath: str, episode_idx: int = None, speed: float = 1.0,
         print(f"\nPlaying Episode {ep_idx} ({len(actions)} frames) - {success_str}")
 
         # Reset robot to start position from first observation
+        # Obs v2 (ego-centric) stores normalized workspace coords — denormalize
         start_obs = obs[0]
-        start_pos = np.array([start_obs[0], start_obs[1], 0.05])
+        x_min, x_max = DEFAULT_WORKSPACE_BOUNDS['x']
+        y_min, y_max = DEFAULT_WORKSPACE_BOUNDS['y']
+        start_x = start_obs[0] * (x_max - x_min) + x_min
+        start_y = start_obs[1] * (y_max - y_min) + y_min
+        start_pos = np.array([start_x, start_y, 0.05])
         jetbot.set_world_pose(position=start_pos)
 
         for frame_idx, action in enumerate(actions):

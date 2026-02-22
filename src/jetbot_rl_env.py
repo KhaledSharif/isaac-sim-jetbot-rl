@@ -55,16 +55,24 @@ class JetbotNavigationEnv(gymnasium.Env):
     performing a point-to-point navigation task. The robot must navigate
     to a goal location while avoiding obstacles using LiDAR sensing.
 
-    Observation Space (34D Box):
-        [0:2]   - Robot position (x, y in meters)
-        [2]     - Robot heading (theta in radians)
-        [3]     - Linear velocity (m/s)
-        [4]     - Angular velocity (rad/s)
-        [5:7]   - Goal position (x, y in meters)
-        [7]     - Distance to goal (meters)
-        [8]     - Angle to goal (radians, relative to robot heading)
+    Observation Space (34D Box, ego-centric):
+        [0]     - Normalized workspace x: (x - x_min) / (x_max - x_min)
+        [1]     - Normalized workspace y: (y - y_min) / (y_max - y_min)
+        [2]     - sin(heading)
+        [3]     - cos(heading)
+        [4]     - Linear velocity (m/s)
+        [5]     - Angular velocity (rad/s)
+        [6]     - Goal body-frame x: dist * cos(angle_to_goal)
+        [7]     - Goal body-frame y: dist * sin(angle_to_goal)
+        [8]     - Distance to goal (meters)
         [9]     - Goal reached flag (0.0 or 1.0)
         [10:34] - LiDAR: 24 normalized distances (0=touching, 1=max range)
+
+    With --add-prev-action (36D Box):
+        [0:10]  - Same as above
+        [10]    - Previous linear velocity command
+        [11]    - Previous angular velocity command
+        [12:36] - LiDAR: 24 normalized distances
 
     Action Space (2D Box, continuous [-1, 1]):
         [0]    - Linear velocity command (normalized)
@@ -105,6 +113,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         inflation_radius: float = 0.08,
         cost_type: str = 'proximity',
         safe_mode: bool = False,
+        add_prev_action: bool = False,
     ):
         """Initialize the Jetbot navigation environment.
 
@@ -133,6 +142,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self.inflation_radius = inflation_radius
         self.cost_type = cost_type
         self.safe_mode = safe_mode
+        self.add_prev_action = add_prev_action
 
         # Create LiDAR sensor
         self.lidar_sensor = LidarSensor(
@@ -141,8 +151,8 @@ class JetbotNavigationEnv(gymnasium.Env):
             max_range=self.LIDAR_MAX_RANGE
         )
 
-        # Define observation and action spaces (10 base + 24 LiDAR)
-        obs_dim = 10 + self.NUM_LIDAR_RAYS
+        # Define observation and action spaces (10 base + optional 2 prev_action + 24 LiDAR)
+        obs_dim = 10 + (2 if self.add_prev_action else 0) + self.NUM_LIDAR_RAYS
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -179,6 +189,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         self._prev_obs = None
         self._current_linear_vel = 0.0
         self._current_angular_vel = 0.0
+        self._prev_action = np.zeros(2, dtype=np.float32)
 
     def _init_isaac_sim(self):
         """Initialize Isaac Sim simulation environment."""
@@ -319,6 +330,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         # Reset velocities
         self._current_linear_vel = 0.0
         self._current_angular_vel = 0.0
+        self._prev_action = np.zeros(2, dtype=np.float32)
 
         # Solvability loop: retry goal + obstacles until A* finds a path
         max_solvability_attempts = 20
@@ -402,7 +414,8 @@ class JetbotNavigationEnv(gymnasium.Env):
         goal_reached = self.scene_manager.check_goal_reached(position, threshold=self.goal_threshold)
 
         # Extract min LiDAR distance from the LiDAR portion of the observation
-        lidar_readings = next_obs[10:]  # Normalized LiDAR values
+        lidar_start = 12 if self.add_prev_action else 10
+        lidar_readings = next_obs[lidar_start:]  # Normalized LiDAR values
         min_lidar = float(lidar_readings.min()) * self.lidar_sensor.max_range
         collision = min_lidar < self.COLLISION_THRESHOLD
 
@@ -424,8 +437,9 @@ class JetbotNavigationEnv(gymnasium.Env):
         terminated = self._check_termination(info, position)
         truncated = self._check_truncation()
 
-        # Update previous observation
+        # Update previous observation and action
         self._prev_obs = next_obs.copy()
+        self._prev_action = np.clip(action, -1.0, 1.0).copy()
 
         return next_obs, reward, terminated, truncated, info
 
@@ -433,7 +447,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         """Build observation vector from current state.
 
         Returns:
-            34D observation vector as float32 numpy array (10 base + 24 LiDAR)
+            34D (or 36D with add_prev_action) observation vector as float32 numpy array
         """
         # Get robot state
         position, heading = self._get_robot_pose()
@@ -446,7 +460,7 @@ class JetbotNavigationEnv(gymnasium.Env):
         # Check goal reached
         goal_reached = self.scene_manager.check_goal_reached(position, threshold=self.goal_threshold)
 
-        return self.obs_builder.build(
+        obs = self.obs_builder.build(
             robot_position=position,
             robot_heading=heading,
             linear_velocity=self._current_linear_vel,
@@ -456,6 +470,14 @@ class JetbotNavigationEnv(gymnasium.Env):
             obstacle_metadata=self.scene_manager.get_obstacle_metadata(),
             workspace_bounds=self.workspace_bounds
         )
+
+        # Insert prev_action after base obs (before LiDAR)
+        if self.add_prev_action:
+            base = obs[:10]
+            lidar = obs[10:]
+            obs = np.concatenate([base, self._prev_action, lidar])
+
+        return obs
 
     def _check_termination(self, info, position):
         """Check if episode should terminate (success or failure).

@@ -55,6 +55,7 @@ from train_sac import (
     load_demo_transitions,
     inject_layernorm_into_critics,
     _apply_gru_lr,
+    _is_crossq_model,
     symlog,
     ChunkCVAEFeatureExtractor,
     TemporalCVAEFeatureExtractor,
@@ -854,10 +855,11 @@ class TestRewardComputerCost:
         """safe_mode=True suppresses proximity penalty in dense reward."""
         rc = RewardComputer(mode='dense', safe_mode=True)
         obs = np.zeros(10)
-        obs[7] = 1.0  # distance to goal
+        obs[8] = 1.0  # distance to goal
         next_obs = np.zeros(10)
-        next_obs[7] = 0.95
-        next_obs[8] = 0.1
+        next_obs[8] = 0.95
+        next_obs[6] = np.cos(0.1)  # goal_body_x for angle=0.1
+        next_obs[7] = np.sin(0.1)  # goal_body_y for angle=0.1
         info = {'min_lidar_distance': 0.15, 'collision': False, 'goal_reached': False}
         reward_safe = rc.compute(obs, np.zeros(2), next_obs, info)
 
@@ -1837,3 +1839,186 @@ class TestGruLearningRate:
         gru = model.actor.features_extractor.gru
         assert gru.weight_ih_l0.grad is not None or True  # Grad cleared after step
         # The key check: CVAE ran without error with gru_lr param
+
+
+# ============================================================================
+# TEST SUITE: CrossQ Compatibility
+# ============================================================================
+
+class TestCrossQCompatibility:
+    """Tests for CrossQ detection and compatibility guards."""
+
+    def test_is_crossq_model_with_sac(self):
+        """_is_crossq_model returns False for SAC models."""
+        import gymnasium as gym
+        from stable_baselines3 import SAC
+        from stable_baselines3.common.vec_env import DummyVecEnv
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        model = SAC("MlpPolicy", vec_env, device='cpu', seed=42)
+        assert _is_crossq_model(model) is False
+        vec_env.close()
+
+    def test_is_crossq_model_with_crossq(self):
+        """_is_crossq_model returns True for CrossQ models."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        model = CrossQ("MlpPolicy", vec_env, device='cpu', seed=42)
+        assert _is_crossq_model(model) is True
+        vec_env.close()
+
+    def test_inject_layernorm_skips_crossq(self, capsys):
+        """inject_layernorm_into_critics is a no-op for CrossQ (BatchRenorm built-in)."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        model = CrossQ("MlpPolicy", vec_env, device='cpu', seed=42)
+
+        # Record critic params before injection attempt
+        import torch
+        params_before = [p.clone() for p in model.critic.parameters()]
+
+        inject_layernorm_into_critics(model)
+
+        # Params should be unchanged (function returned early)
+        params_after = list(model.critic.parameters())
+        for p_before, p_after in zip(params_before, params_after):
+            assert torch.equal(p_before, p_after), "CrossQ critic params changed after inject_layernorm"
+
+        captured = capsys.readouterr()
+        assert "CrossQ detected" in captured.out
+        vec_env.close()
+
+    def test_crossq_has_no_critic_target(self):
+        """CrossQ models should not have a critic_target attribute."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        model = CrossQ("MlpPolicy", vec_env, device='cpu', seed=42)
+
+        # CrossQ should have no critic_target (or it should be None)
+        critic_target = getattr(model, 'critic_target', None)
+        assert critic_target is None, \
+            f"CrossQ should not have critic_target, but got {type(critic_target)}"
+        vec_env.close()
+
+    def test_pretrain_cvae_no_critic_target_copy(self, tmp_path):
+        """pretrain_chunk_cvae handles missing critic_target gracefully."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+        chunk_size = 5
+        z_dim = 8
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(chunk_size * 2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=z_dim)
+        features_dim = 96 + z_dim
+        policy_kwargs = dict(
+            net_arch=dict(pi=[64, 64], qf=[64, 64]),
+            activation_fn=torch.nn.ReLU,
+            features_extractor_class=fe_cls,
+            features_extractor_kwargs=dict(features_dim=features_dim),
+        )
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        model = CrossQ("MlpPolicy", vec_env, device='cpu',
+                        policy_kwargs=policy_kwargs, seed=42)
+
+        # Create minimal demo data
+        total = 100
+        obs = np.random.randn(total, 34).astype(np.float32)
+        actions = np.random.randn(total, 2).astype(np.float32)
+        ep_lengths = np.array([50, 50])
+
+        # Should not raise despite missing critic_target
+        pretrain_chunk_cvae(
+            model, obs, actions, ep_lengths,
+            chunk_size=chunk_size, z_dim=z_dim,
+            epochs=2, batch_size=32, lr=1e-3, beta=0.1,
+        )
+        vec_env.close()

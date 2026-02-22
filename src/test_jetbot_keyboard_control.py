@@ -203,13 +203,12 @@ class TestObservationBuilder:
         )
 
         assert obs.shape == (10,)
-        assert obs[0] == 1.0  # x
-        assert obs[1] == 2.0  # y
-        assert obs[2] == 0.5  # heading
-        assert np.isclose(obs[3], 0.2)  # linear vel
-        assert np.isclose(obs[4], 0.1)  # angular vel
-        assert obs[5] == 3.0  # goal x
-        assert obs[6] == 4.0  # goal y
+        assert np.isclose(obs[0], 0.75, atol=1e-4)   # norm_ws_x = (1.0 - (-2)) / 4
+        assert np.isclose(obs[1], 1.0, atol=1e-4)    # norm_ws_y = (2.0 - (-2)) / 4
+        assert np.isclose(obs[2], np.sin(0.5), atol=1e-4)  # sin(heading)
+        assert np.isclose(obs[3], np.cos(0.5), atol=1e-4)  # cos(heading)
+        assert np.isclose(obs[4], 0.2, atol=1e-4)    # linear vel
+        assert np.isclose(obs[5], 0.1, atol=1e-4)    # angular vel
         assert obs[9] == 0.0  # goal not reached
 
     def test_build_observation_goal_reached(self):
@@ -244,7 +243,7 @@ class TestObservationBuilder:
         )
 
         # Angle to goal should be 0 (facing goal)
-        assert abs(obs[8]) < 0.01
+        assert abs(np.arctan2(obs[7], obs[6])) < 0.01
 
     def test_build_observation_distance_to_goal(self):
         """Test distance to goal calculation."""
@@ -261,7 +260,7 @@ class TestObservationBuilder:
         )
 
         # Distance should be 5.0 (3-4-5 triangle)
-        assert abs(obs[7] - 5.0) < 0.01
+        assert abs(obs[8] - 5.0) < 0.01
 
 
 # ============================================================================
@@ -314,12 +313,13 @@ class TestRewardComputer:
 
         # Previous obs: distance = 5.0
         prev_obs = np.zeros(10)
-        prev_obs[7] = 5.0
+        prev_obs[8] = 5.0
 
         # Current obs: distance = 4.0 (got closer)
         next_obs = np.zeros(10)
-        next_obs[7] = 4.0
-        next_obs[8] = 0.0  # Facing goal
+        next_obs[8] = 4.0
+        next_obs[6] = 4.0  # goal_body_x (facing goal: angle=0)
+        next_obs[7] = 0.0  # goal_body_y
 
         reward = computer.compute(
             obs=prev_obs,
@@ -363,10 +363,11 @@ class TestRewardComputer:
         computer = RewardComputer(mode='dense')
 
         prev_obs = np.zeros(10)
-        prev_obs[7] = 2.0
+        prev_obs[8] = 2.0
         next_obs = np.zeros(10)
-        next_obs[7] = 2.0
-        next_obs[8] = 0.0
+        next_obs[8] = 2.0
+        next_obs[6] = 2.0
+        next_obs[7] = 0.0
 
         # Close to obstacle (min_lidar < threshold)
         reward_close = computer.compute(
@@ -388,10 +389,11 @@ class TestRewardComputer:
         computer = RewardComputer(mode='dense')
 
         prev_obs = np.zeros(10)
-        prev_obs[7] = 2.0
+        prev_obs[8] = 2.0
         next_obs = np.zeros(10)
-        next_obs[7] = 2.0
-        next_obs[8] = 0.0
+        next_obs[8] = 2.0
+        next_obs[6] = 2.0
+        next_obs[7] = 0.0
 
         reward_no_lidar = computer.compute(
             obs=prev_obs, action=np.zeros(2), next_obs=next_obs,
@@ -412,10 +414,11 @@ class TestRewardComputer:
 
         # Robot far from goal (gate = 1.0, full penalty)
         prev_far = np.zeros(10)
-        prev_far[7] = 2.0
+        prev_far[8] = 2.0
         next_far = np.zeros(10)
-        next_far[7] = 2.0
-        next_far[8] = 0.0
+        next_far[8] = 2.0
+        next_far[6] = 2.0
+        next_far[7] = 0.0
 
         reward_far_goal = computer.compute(
             obs=prev_far, action=np.zeros(2), next_obs=next_far,
@@ -424,10 +427,11 @@ class TestRewardComputer:
 
         # Robot near goal (gate < 1.0, reduced penalty)
         prev_near = np.zeros(10)
-        prev_near[7] = 0.25
+        prev_near[8] = 0.25
         next_near = np.zeros(10)
-        next_near[7] = 0.25
-        next_near[8] = 0.0
+        next_near[8] = 0.25
+        next_near[6] = 0.25
+        next_near[7] = 0.0
 
         reward_near_goal = computer.compute(
             obs=prev_near, action=np.zeros(2), next_obs=next_near,
@@ -436,10 +440,11 @@ class TestRewardComputer:
 
         # Robot at goal (gate = 0.0, no penalty)
         prev_at = np.zeros(10)
-        prev_at[7] = 0.0
+        prev_at[8] = 0.0
         next_at = np.zeros(10)
-        next_at[7] = 0.0
         next_at[8] = 0.0
+        next_at[6] = 0.0
+        next_at[7] = 0.0
 
         reward_at_goal = computer.compute(
             obs=prev_at, action=np.zeros(2), next_obs=next_at,
@@ -813,9 +818,9 @@ class TestDemoRecorder:
         rc = RewardComputer(mode='dense')
 
         obs = np.zeros(34)
-        obs[7] = 1.0  # distance to goal
+        obs[8] = 1.0  # distance to goal
         next_obs = np.zeros(34)
-        next_obs[7] = 1.0
+        next_obs[8] = 1.0
 
         # Close to obstacle (should have proximity penalty)
         info_close = {'goal_reached': False, 'collision': False, 'min_lidar_distance': 0.15}
@@ -1045,8 +1050,9 @@ class TestAutoPilot:
         pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
 
         obs = np.zeros(10)
-        obs[7] = 1.0   # distance = 1m
-        obs[8] = 0.0   # angle = 0 (facing goal)
+        obs[8] = 1.0   # distance = 1m
+        obs[6] = 1.0   # goal_body_x (facing goal: angle=0)
+        obs[7] = 0.0   # goal_body_y
 
         linear, angular = pilot.compute_action(obs)
         assert linear > 0.0, "Should drive forward when facing goal"
@@ -1058,8 +1064,9 @@ class TestAutoPilot:
         pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
 
         obs = np.zeros(10)
-        obs[7] = 1.0
-        obs[8] = np.pi / 4  # goal is 45 degrees to the left
+        obs[8] = 1.0
+        obs[6] = np.cos(np.pi / 4)   # goal_body_x
+        obs[7] = np.sin(np.pi / 4)   # goal_body_y (goal is 45 degrees to the left)
 
         _, angular = pilot.compute_action(obs)
         assert angular > 0.0, "Should turn left (positive angular) when goal is left"
@@ -1070,8 +1077,9 @@ class TestAutoPilot:
         pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
 
         obs = np.zeros(10)
-        obs[7] = 1.0
-        obs[8] = -np.pi / 4  # goal is 45 degrees to the right
+        obs[8] = 1.0
+        obs[6] = np.cos(-np.pi / 4)   # goal_body_x
+        obs[7] = np.sin(-np.pi / 4)   # goal_body_y (goal is 45 degrees to the right)
 
         _, angular = pilot.compute_action(obs)
         assert angular < 0.0, "Should turn right (negative angular) when goal is right"
@@ -1082,8 +1090,9 @@ class TestAutoPilot:
         pilot = AutoPilot(noise_linear=0.0, noise_angular=0.0)
 
         obs = np.zeros(10)
-        obs[7] = 1.0
-        obs[8] = np.pi  # facing completely away
+        obs[8] = 1.0
+        obs[6] = -1.0   # goal_body_x = cos(pi) = -1
+        obs[7] = 0.0    # goal_body_y = sin(pi) ~ 0
 
         linear, _ = pilot.compute_action(obs)
         assert abs(linear) < 0.05, "Should have near-zero linear vel when facing away"
@@ -1098,8 +1107,9 @@ class TestAutoPilot:
                           kp_angular=100.0)  # very high gain to force clipping
 
         obs = np.zeros(10)
-        obs[7] = 1.0
-        obs[8] = np.pi  # large angle
+        obs[8] = 1.0
+        obs[6] = -1.0   # goal_body_x = cos(pi) = -1
+        obs[7] = 0.0    # goal_body_y = sin(pi) ~ 0
 
         linear, angular = pilot.compute_action(obs)
         assert abs(linear) <= max_lin + 1e-6
@@ -1111,8 +1121,9 @@ class TestAutoPilot:
         pilot = AutoPilot(noise_linear=0.03, noise_angular=0.15)
 
         obs = np.zeros(10)
-        obs[7] = 1.0
-        obs[8] = 0.0
+        obs[8] = 1.0
+        obs[6] = 1.0   # goal_body_x (facing goal: angle=0)
+        obs[7] = 0.0   # goal_body_y
 
         results = [pilot.compute_action(obs) for _ in range(20)]
         linear_vals = [r[0] for r in results]
@@ -1127,14 +1138,16 @@ class TestAutoPilot:
 
         # Far from goal
         obs_far = np.zeros(10)
-        obs_far[7] = 2.0
-        obs_far[8] = 0.0
+        obs_far[8] = 2.0
+        obs_far[6] = 2.0   # goal_body_x (facing goal: angle=0)
+        obs_far[7] = 0.0   # goal_body_y
         linear_far, _ = pilot.compute_action(obs_far)
 
         # Close to goal
         obs_near = np.zeros(10)
-        obs_near[7] = 0.1
-        obs_near[8] = 0.0
+        obs_near[8] = 0.1
+        obs_near[6] = 0.1   # goal_body_x (facing goal: angle=0)
+        obs_near[7] = 0.0   # goal_body_y
         linear_near, _ = pilot.compute_action(obs_near)
 
         assert linear_near < linear_far, "Should slow down near goal"
@@ -1145,7 +1158,7 @@ class TestAutoPilot:
         pilot = AutoPilot()
 
         obs = np.zeros(10)
-        obs[7] = 1.0
+        obs[8] = 1.0
 
         result = pilot.compute_action(obs)
         assert isinstance(result, tuple)

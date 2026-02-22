@@ -30,28 +30,31 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
    - Critic pretraining on Monte Carlo returns
    - Pipeline: validate → prewarm VecNormalize → BC warmstart → critic pretrain → PPO
 
-4. **SAC/TQC + Chunk CVAE + Q-Chunking Pipeline** (`src/train_sac.py`)
-   - TQC (sb3-contrib) with SAC fallback
+4. **CrossQ/TQC + Chunk CVAE + Q-Chunking Pipeline** (`src/train_sac.py`)
+   - **CrossQ** (default, sb3-contrib ≥ 2.4.0): BatchRenorm critics, no target networks, UTD=1 (~35-39 steps/s)
+   - TQC fallback via `--legacy-tqc` (5 quantile critics, UTD=20, ~2.9 steps/s)
+   - SAC fallback if sb3-contrib unavailable
    - **Chunk CVAE**: Actor predicts k-step action chunks; CVAE handles multimodal demos
    - **Q-chunking**: `ChunkedEnvWrapper` makes critic evaluate chunk-level Q-values
    - RLPD-style demo/online replay buffer sampling (configurable via `--demo-ratio`)
-   - LayerNorm in critics (replaces VecNormalize)
-   - UTD ratio configurable via `--utd-ratio` (default 20, recommended 5 for speed)
+   - LayerNorm in critics for TQC/SAC (skipped for CrossQ — BatchRenorm built-in)
+   - UTD ratio configurable via `--utd-ratio` (default 1 for CrossQ, recommended 20 for legacy TQC)
    - `--resume` to continue training from a checkpoint (step counter, weights preserved)
    - `--chunk-size` to control action chunk length (default 10)
    - **SafeTQC** (`--safe`): Constrained RL with dual critic + Lagrange multiplier
-     - Separate cost critic estimates obstacle violation costs
+     - Separate cost critic estimates obstacle violation costs (always has its own target network)
      - Learned Lagrange multiplier auto-balances reward vs. safety
      - Auto-removes proximity penalty from reward (override with `--keep-proximity-reward`)
      - Requires demos recorded with cost data (`has_cost` metadata)
+     - Compatible with CrossQ base (no reward critic target, but cost critic target preserved)
 
 5. **Supporting Scripts**
-   - `eval_policy.py` - Policy evaluation and metrics (auto-detects TQC/SAC/PPO and chunk size from model action space; wraps env with `ChunkedEnvWrapper` for chunked models)
+   - `eval_policy.py` - Policy evaluation and metrics (auto-detects CrossQ/TQC/SAC/PPO and chunk size from model action space; wraps env with `ChunkedEnvWrapper` for chunked models)
    - `train_bc.py` - Behavioral cloning from demonstrations
    - `replay.py` - Demo playback and inspection
 
 6. **Shared Modules**
-   - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds) and `quaternion_to_yaw()` utility
+   - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds), `quaternion_to_yaw()` utility, and `OBS_VERSION` constant
    - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, `build_frame_stacks()`, and `VerboseEpisodeCallback`
    - `demo_io.py` - Unified demo I/O adapter: `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) incremental recording, `convert_npz_to_hdf5()` migration utility
 
@@ -72,10 +75,10 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
 - **FrameStackWrapper**: Gymnasium wrapper stacking last n_frames observations into a single flattened vector; oldest first for natural GRU input order (`src/jetbot_rl_env.py`)
 - **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`)
-- **ChunkCVAEFeatureExtractor**: SB3 feature extractor splitting obs into state MLP (10→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D
+- **ChunkCVAEFeatureExtractor**: SB3 feature extractor with dynamic split: state MLP (state_dim→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D. Split is `obs[:obs_dim-24]` / `obs[obs_dim-24:]` to support 34D and 36D
 - **TemporalCVAEFeatureExtractor**: GRU-based SB3 feature extractor for frame-stacked obs; per-frame state/lidar MLPs → GRU → hidden state + z-pad (`src/train_sac.py`)
 - **pretrain_chunk_cvae()**: CVAE pretraining — encoder maps (obs, action_chunk) → z, decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk; encoder discarded after pretraining
-- **SafeTQC**: TQC subclass with dual cost critic + Lagrange multiplier for constrained RL (`src/train_sac.py`)
+- **SafeTQC**: CrossQ/TQC subclass with dual cost critic + Lagrange multiplier for constrained RL (`src/train_sac.py`)
 - **CostReplayBuffer**: Parallel ring buffer storing per-transition costs alongside the main replay buffer (`src/train_sac.py`)
 - **MeanCostCritic**: Twin-Q mean-value cost critic with independent feature extractor (`src/train_sac.py`)
 - **SafeTrainingCallback**: SB3 callback tracking per-transition and per-episode costs, logging to TensorBoard (`src/train_sac.py`)
@@ -114,21 +117,27 @@ System:
 
 ## State & Action Spaces
 
-### Observation Space (34D for RL env, 10D base for keyboard control)
+### Observation Space (34D ego-centric, OBS_VERSION=2)
 ```
-[0:2]   - Robot position (x, y)
-[2]     - Robot heading (theta)
-[3]     - Linear velocity
-[4]     - Angular velocity
-[5:7]   - Goal position (x, y)
-[7]     - Distance to goal
-[8]     - Angle to goal
+[0]     - Normalized workspace X: (x - x_min) / (x_max - x_min) ∈ [0,1]
+[1]     - Normalized workspace Y: (y - y_min) / (y_max - y_min) ∈ [0,1]
+[2]     - sin(heading) — no discontinuity at ±π
+[3]     - cos(heading)
+[4]     - Linear velocity
+[5]     - Angular velocity
+[6]     - Goal body-frame X: dist * cos(angle_to_goal)
+[7]     - Goal body-frame Y: dist * sin(angle_to_goal)
+[8]     - Distance to goal
 [9]     - Goal reached flag
 [10:34] - LiDAR: 24 normalized distances (0=touching, 1=max range), 180° FOV
 ```
 
-The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR.
+With `--add-prev-action` (36D): inserts `[prev_linear_vel, prev_angular_vel]` at indices [10:12], pushing LiDAR to [12:36].
+
+The RL environment (`JetbotNavigationEnv`) always uses 34D observations with LiDAR (36D with `--add-prev-action`).
 The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
+
+**Feature extractor split**: `state = obs[:obs_dim-24]`, `lidar = obs[obs_dim-24:]` — dynamic split supports both 34D and 36D observations.
 
 ### Action Space (2D)
 ```
@@ -173,24 +182,30 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # PPO Training with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
-# SAC/TQC + Chunk CVAE + Q-Chunking (recommended)
+# CrossQ + Chunk CVAE + Q-Chunking (recommended, ~35-39 steps/s)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
+
+# Legacy TQC (slower but proven, ~2.9 steps/s at UTD=20)
+./run.sh train_sac.py --demos demos/recording.npz --headless --legacy-tqc --utd-ratio 20
 
 # Custom chunk size and UTD ratio
 ./run.sh train_sac.py --demos demos/recording.npz --headless --chunk-size 5 --utd-ratio 5
 
-# SAC/TQC with custom demo ratio (75% demo, 25% online)
+# CrossQ with custom demo ratio (75% demo, 25% online)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --demo-ratio 0.75
 
 # Custom CVAE hyperparameters
 ./run.sh train_sac.py --demos demos/recording.npz --headless \
   --cvae-epochs 200 --cvae-beta 0.05 --cvae-z-dim 16
 
-# SAC/TQC with GRU recurrent policy via frame stacking
+# GRU recurrent policy via frame stacking
 ./run.sh train_sac.py --demos demos/recording.npz --headless --n-frames 4 --gru-hidden 128
 
-# Resume SAC/TQC training from checkpoint
-./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/tqc_jetbot_50000_steps.zip --timesteps 500000
+# Resume training from checkpoint
+./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/crossq_jetbot_50000_steps.zip --timesteps 500000
+
+# Include previous action in observations (36D instead of 34D)
+./run.sh train_sac.py --demos demos/recording.npz --headless --add-prev-action
 
 # SafeTQC: constrained RL with cost critic + Lagrange multiplier
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe
@@ -201,15 +216,15 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 # SafeTQC keeping proximity penalty in reward (default: auto-removed)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe --keep-proximity-reward
 
-# Evaluation (auto-detects TQC/SAC/PPO and chunk size)
-./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100
+# Evaluation (auto-detects CrossQ/TQC/SAC/PPO and chunk size)
+./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100
 ./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
 
 # Evaluation with cost tracking
-./run.sh eval_policy.py models/tqc_jetbot.zip --episodes 100 --safe --cost-type proximity
+./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100 --safe --cost-type proximity
 
 # Evaluation with explicit chunk size or inflation radius
-./run.sh eval_policy.py models/tqc_jetbot.zip --chunk-size 5 --inflation-radius 0.08
+./run.sh eval_policy.py models/crossq_jetbot.zip --chunk-size 5 --inflation-radius 0.08
 
 # Tests
 ./run_tests.sh
@@ -234,8 +249,8 @@ isaac-sim-jetbot-keyboard/
 │   ├── camera_streamer.py            # Camera streaming module
 │   ├── jetbot_rl_env.py              # Gymnasium RL environment + ChunkedEnvWrapper
 │   ├── train_rl.py                   # PPO training script
-│   ├── train_sac.py                  # SAC/TQC + Chunk CVAE + Q-Chunking training script
-│   ├── eval_policy.py                # Policy evaluation (auto-detects TQC/SAC/PPO + chunk size)
+│   ├── train_sac.py                  # CrossQ/TQC/SAC + Chunk CVAE + Q-Chunking training script
+│   ├── eval_policy.py                # Policy evaluation (auto-detects CrossQ/TQC/SAC/PPO + chunk size)
 │   ├── train_bc.py                   # Behavioral cloning
 │   ├── replay.py                     # Demo playback
 │   ├── test_jetbot_keyboard_control.py
@@ -280,19 +295,19 @@ The RL training pipeline uses SB3's `VecNormalize` to z-score normalize observat
 
 ## Training Performance & Bottlenecks
 
-### UTD Ratio is the Dominant Cost (Not Physics)
+### CrossQ@UTD=1 vs TQC@UTD=20
 
-The primary bottleneck in SAC/TQC training is **gradient computation, not `world.step()`**. With UTD=20 (default), each env step triggers 20 backward passes through TQC's 5 critic networks + actor. Measured on RTX 3090 Ti with 50 obstacles:
+CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via BatchRenorm in critics and no target networks. This eliminates the gradient bottleneck:
 
-| UTD Ratio | Steps/s | Time for 1M steps |
-|-----------|---------|-------------------|
-| 20        | ~2.9    | ~4 days            |
-| 5         | ~10-12  | ~24 hours          |
-| 1         | ~39     | ~7 hours           |
+| Algorithm | UTD | Steps/s | Time for 1M steps | Speedup |
+|-----------|-----|---------|-------------------|---------|
+| TQC       | 20  | ~2.9    | ~4 days           | 1x      |
+| TQC       | 5   | ~10-12  | ~24 hours         | ~4x     |
+| CrossQ    | 1   | ~35-39  | ~7 hours          | ~13x    |
 
-The env step itself (`world.step()`) takes only ~25ms. At UTD=20, the 20 gradient updates add ~330ms on top.
+The env step itself (`world.step()`) takes only ~25ms. TQC@UTD=20 adds ~330ms of gradient computation per step.
 
-**Recommendation:** Use `--utd-ratio 5` for a good speed/sample-efficiency tradeoff. UTD=20 (RLPD paper default) is only worth it if you can afford multi-day runs.
+**Recommendation:** Use CrossQ (default) for ~13x speedup. Use `--legacy-tqc --utd-ratio 20` only if you need exact TQC reproduction.
 
 ### Obstacle Types: Visual vs Fixed
 
@@ -317,7 +332,7 @@ These collectively save a few ms per step but are minor compared to UTD ratio.
 
 ## Chunk CVAE + Q-Chunking
 
-The SAC/TQC pipeline uses action chunking to reduce compounding errors from single-step BC. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking).
+The CrossQ/TQC pipeline uses action chunking to reduce compounding errors from single-step BC. The actor predicts k-step action chunks, a CVAE handles multimodal demonstrations, and a `ChunkedEnvWrapper` enables chunk-level Q-values (Q-chunking).
 
 ### Architecture
 ```
@@ -327,17 +342,17 @@ ChunkedEnvWrapper: action_space (2,) → (k*2,), executes k sub-steps per wrappe
 Actor:  obs(34D) → ChunkCVAEFeatureExtractor → (obs_features || z=0) → latent_pi → mu → tanh → (k*2)
 Critic: Q(obs_features || z=0, action_chunk) → scalar
 
-ChunkCVAEFeatureExtractor:
-  34D obs → split → [state 0:10]  → symlog → MLP(10→64→32)  →  32D ┐
-                     [lidar 10:34] → symlog → MLP(24→128→64)  →  64D ├→ concat → 96D + z_pad(8D) = 104D
-                                                                      └→ z_pad = zeros(z_dim)
+ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
+  obs → split → [state 0:state_dim]       → symlog → MLP(state_dim→64→32) → 32D ┐
+                 [lidar state_dim:obs_dim] → symlog → MLP(24→128→64)       → 64D ├→ concat → 96D + z_pad(8D) = 104D
+                                                                                   └→ z_pad = zeros(z_dim)
 
 TemporalCVAEFeatureExtractor (when --n-frames > 1):
   Wrapping order: ChunkedEnvWrapper( FrameStackWrapper( JetbotNavigationEnv ) )
-  Input: (batch, n_frames * 34) flattened
-  Reshape → (batch, n_frames, 34)
-  Per-frame:  state_mlp(obs[:10]) → 32D  }
-              lidar_mlp(obs[10:34]) → 64D } → 96D per frame
+  Input: (batch, n_frames * per_frame_dim) flattened
+  Reshape → (batch, n_frames, per_frame_dim)
+  Per-frame:  state_mlp(obs[:state_dim]) → 32D  }
+              lidar_mlp(obs[state_dim:]) → 64D   } → 96D per frame
   GRU: (batch, n_frames, 96) → last hidden → (batch, gru_hidden_dim)
   Z-pad: concat(gru_output, zeros(z_dim)) → (gru_hidden_dim + z_dim)D
 
@@ -352,10 +367,10 @@ CVAE pretraining (replaces BC warmstart):
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
 2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
 3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-2.0
-4. Inject LayerNorm into critics (`inject_layernorm_into_critics()`)
+4. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
 5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
-6. Copy pretrained feature extractor weights → critic/critic_target
-7. Train with SAC/TQC (no auxiliary callback needed — CVAE encoder is discarded)
+6. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
+7. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
 
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
@@ -375,6 +390,10 @@ CVAE pretraining (replaces BC warmstart):
 ### CLI Flags
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--legacy-tqc` | off | Use TQC instead of CrossQ (legacy mode) |
+| `--utd-ratio` | 1 | Update-to-data ratio (CrossQ=1, legacy TQC=20) |
+| `--policy-delay` | 1 | Actor update delay (CrossQ paper uses 20 with UTD=20) |
+| `--add-prev-action` | off | Include previous action in observations (36D instead of 34D) |
 | `--chunk-size` | 10 | Action chunk size (k) |
 | `--n-frames` | 1 | Number of observations to stack (1 = no stacking) |
 | `--gru-hidden` | 128 | GRU hidden dimension (only used when n-frames > 1) |
@@ -404,10 +423,13 @@ CVAE pretraining (replaces BC warmstart):
 9. Train with `SafeTrainingCallback` tracking per-step costs
 
 ### Compatibility
-- `inject_layernorm_into_critics`: Unaffected — operates on critic nets after feature extraction
+- `inject_layernorm_into_critics`: Skipped for CrossQ (BatchRenorm built-in); operates on critic nets for TQC/SAC
 - Replay buffer: Uses chunk-level transitions (obs, k*2 action, R_chunk, next_obs, done)
 - `--resume`: Works — SB3 pickles `features_extractor_class`; chunk_size auto-detected from action_dim
-- `eval_policy.py`: Auto-detects chunk_size from model action space, wraps eval env with ChunkedEnvWrapper
+- `eval_policy.py`: Auto-detects CrossQ/TQC/SAC/PPO, chunk_size, and n_frames from model spaces
+- **CrossQ + SafeTQC**: Cost critic has its own target network (independent of base algorithm); reward critic uses `getattr(self, 'critic_target', None) or self.critic` pattern
+- **CrossQ + DualPolicy**: IBRL TD targets use same `_critic_for_target` pattern; polyak update guarded
+- **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric layout on load via `convert_obs_to_egocentric()` in `demo_utils.py`
 
 ## Testing
 
@@ -475,6 +497,6 @@ Optional for HDF5 demo recording (recommended):
 Optional for RL:
 - torch (PyTorch — bundled with Isaac Sim)
 - stable-baselines3
-- sb3-contrib (for TQC; falls back to SAC without it)
+- sb3-contrib ≥ 2.4.0 (for CrossQ and TQC; falls back to SAC without it)
 - gymnasium
 - tensorboard
