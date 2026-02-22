@@ -374,6 +374,7 @@ CVAE pretraining (replaces BC warmstart):
 
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
+- **_set_bn_mode()**: Toggle BatchRenorm training mode if supported (CrossQ only; no-op for TQC/SAC)
 - **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
 - **TemporalCVAEFeatureExtractor.get_class()**: Returns GRU-based SB3 feature extractor for frame-stacked observations
 - **pretrain_chunk_cvae()**: CVAE pretraining on demo action chunks; trains feature extractor + actor layers
@@ -427,8 +428,8 @@ CVAE pretraining (replaces BC warmstart):
 - Replay buffer: Uses chunk-level transitions (obs, k*2 action, R_chunk, next_obs, done)
 - `--resume`: Works — SB3 pickles `features_extractor_class`; chunk_size auto-detected from action_dim
 - `eval_policy.py`: Auto-detects CrossQ/TQC/SAC/PPO, chunk_size, and n_frames from model spaces
-- **CrossQ + SafeTQC**: Cost critic has its own target network (independent of base algorithm); reward critic uses `getattr(self, 'critic_target', None) or self.critic` pattern
-- **CrossQ + DualPolicy**: IBRL TD targets use same `_critic_for_target` pattern; polyak update guarded
+- **CrossQ + SafeTQC**: Joint forward pass concatenates `[obs, next_obs]` (2*B batch) through critic so BatchRenorm sees the mixture distribution; cost critic has its own target network (independent of base algorithm); `_set_bn_mode()` toggles BatchRenorm training mode; actor updates gated by `policy_delay`
+- **CrossQ + DualPolicy**: Joint forward pass concatenates `[obs, next_obs, next_obs]` (3*B batch) for IBRL current/RL/IL Q-values; `_set_bn_mode()` + `policy_delay` gating; polyak update guarded
 - **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric layout on load via `convert_obs_to_egocentric()` in `demo_utils.py`
 
 ## Testing

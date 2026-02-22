@@ -47,6 +47,13 @@ def _is_crossq_model(model):
         return False
 
 
+def _set_bn_mode(module, mode):
+    """Toggle BatchRenorm training mode if supported (CrossQ only; no-op for TQC/SAC)."""
+    fn = getattr(module, 'set_bn_training_mode', None)
+    if fn is not None:
+        fn(mode)
+
+
 class ChunkCVAEFeatureExtractor:
     """SB3 feature extractor for Chunk CVAE with split state/lidar MLPs.
 
@@ -803,6 +810,8 @@ def _create_safe_tqc_class(tqc_base_cls):
         def train(self, gradient_steps, batch_size=64):
             # Switch to train mode
             self.policy.set_training_mode(True)
+            is_crossq = _is_crossq_model(self)
+            policy_delay = getattr(self, 'policy_delay', 1)
 
             # Update learning rate
             self._update_learning_rate(
@@ -815,6 +824,9 @@ def _create_safe_tqc_class(tqc_base_cls):
             cost_critic_losses, lagrange_values = [], []
 
             for _ in range(gradient_steps):
+                if is_crossq:
+                    self._n_updates += 1
+
                 # Sample replay buffer
                 replay_data = self.replay_buffer.sample(
                     batch_size, env=self._vec_normalize_env
@@ -827,120 +839,107 @@ def _create_safe_tqc_class(tqc_base_cls):
                     online_idx = getattr(self.replay_buffer, '_last_online_indices', None)
                     cost_data = self.cost_buffer.sample(demo_idx, online_idx)
 
-                # --- Entropy coefficient update ---
-                # Action by the current actor for the sampled observations
-                actions_pi, log_prob = self.actor.action_log_prob(
-                    replay_data.observations
-                )
-                log_prob = log_prob.reshape(-1, 1)
-
+                # Read ent_coef before critic update (no actor forward pass yet)
                 ent_coef = torch.exp(self.log_ent_coef.detach())
-                ent_coef_loss = -(
-                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
-                ).mean()
-                ent_coef_losses.append(ent_coef_loss.item())
-
-                self.ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                self.ent_coef_optimizer.step()
-
                 ent_coefs.append(ent_coef.item())
 
                 # --- Reward critic update ---
                 with torch.no_grad():
+                    _set_bn_mode(self.actor, False)
                     next_actions, next_log_prob = self.actor.action_log_prob(
                         replay_data.next_observations
                     )
                     next_log_prob = next_log_prob.reshape(-1, 1)
 
-                    # Compute target Q-values
-                    # CrossQ has no target network — use critic directly
-                    _critic_for_target = getattr(self, 'critic_target', None) or self.critic
-                    _qc_target = _get_tqc_quantile_critics(_critic_for_target)
-                    if _qc_target is not None:
-                        # TQC: iterate quantile critics, sort & drop top quantiles
-                        next_quantiles = []
-                        for critic_net in _qc_target:
-                            features = _critic_for_target.features_extractor(
-                                replay_data.next_observations
+                if is_crossq:
+                    # CrossQ joint forward pass: BatchRenorm sees obs+next_obs mixture
+                    with torch.no_grad():
+                        next_q_target = torch.min(
+                            torch.cat(self.critic(
+                                replay_data.next_observations, next_actions
+                            ), dim=1), dim=1, keepdim=True
+                        )[0]
+                        target_q = replay_data.rewards + (
+                            1 - replay_data.dones
+                        ) * self.gamma * (next_q_target.detach() - ent_coef * next_log_prob)
+
+                    all_obs = torch.cat([replay_data.observations, replay_data.next_observations], dim=0)
+                    all_actions = torch.cat([replay_data.actions, next_actions], dim=0)
+                    _set_bn_mode(self.critic, True)
+                    all_q_values = torch.cat(
+                        self.critic(all_obs, all_actions), dim=1
+                    )  # (2*B, n_critics)
+                    _set_bn_mode(self.critic, False)
+                    current_q_values, _ = torch.split(all_q_values, batch_size, dim=0)
+                    critic_loss = 0.5 * sum(
+                        F.mse_loss(current_q_values[:, i:i+1], target_q)
+                        for i in range(current_q_values.shape[1])
+                    )
+                else:
+                    # TQC/SAC: separate forward passes (existing code)
+                    with torch.no_grad():
+                        # Compute target Q-values
+                        _critic_for_target = getattr(self, 'critic_target', None) or self.critic
+                        _qc_target = _get_tqc_quantile_critics(_critic_for_target)
+                        if _qc_target is not None:
+                            # TQC: iterate quantile critics, sort & drop top quantiles
+                            next_quantiles = []
+                            for critic_net in _qc_target:
+                                features = _critic_for_target.features_extractor(
+                                    replay_data.next_observations
+                                )
+                                x = torch.cat([features, next_actions], dim=-1)
+                                next_quantiles.append(critic_net(x))
+                            next_quantiles = torch.stack(next_quantiles, dim=1)
+                            # Sort and drop top quantiles
+                            sorted_q, _ = torch.sort(
+                                next_quantiles.reshape(batch_size, -1), dim=1
                             )
-                            x = torch.cat([features, next_actions], dim=-1)
-                            next_quantiles.append(critic_net(x))
-                        next_quantiles = torch.stack(next_quantiles, dim=1)
-                        # Sort and drop top quantiles
-                        sorted_q, _ = torch.sort(
-                            next_quantiles.reshape(batch_size, -1), dim=1
-                        )
-                        n_target_quantiles = sorted_q.shape[1] - self.top_quantiles_to_drop_per_net * len(_qc_target)
-                        if n_target_quantiles > 0:
-                            sorted_q = sorted_q[:, :n_target_quantiles]
-                        next_q = sorted_q.mean(dim=1, keepdim=True)
-                    else:
-                        # SAC/CrossQ: use critic forward, min of Q-values
-                        next_q_values = _critic_for_target(
-                            replay_data.next_observations, next_actions
-                        )
-                        if isinstance(next_q_values, (list, tuple)):
-                            next_q = torch.min(
-                                torch.cat(next_q_values, dim=1), dim=1, keepdim=True
-                            )[0]
-                        elif next_q_values.dim() == 3:
-                            # Stacked TQC output (batch, n_critics, n_quantiles)
-                            all_q = next_q_values.reshape(batch_size, -1)
-                            sorted_q, _ = torch.sort(all_q, dim=1)
-                            n_critics = next_q_values.shape[1]
-                            n_drop = getattr(self, 'top_quantiles_to_drop_per_net', 0) * n_critics
-                            n_target = sorted_q.shape[1] - n_drop
-                            if n_target > 0:
-                                sorted_q = sorted_q[:, :n_target]
+                            n_target_quantiles = sorted_q.shape[1] - self.top_quantiles_to_drop_per_net * len(_qc_target)
+                            if n_target_quantiles > 0:
+                                sorted_q = sorted_q[:, :n_target_quantiles]
                             next_q = sorted_q.mean(dim=1, keepdim=True)
                         else:
-                            next_q = next_q_values
+                            # SAC: use critic forward, min of Q-values
+                            next_q_values = _critic_for_target(
+                                replay_data.next_observations, next_actions
+                            )
+                            if isinstance(next_q_values, (list, tuple)):
+                                next_q = torch.min(
+                                    torch.cat(next_q_values, dim=1), dim=1, keepdim=True
+                                )[0]
+                            elif next_q_values.dim() == 3:
+                                # Stacked TQC output (batch, n_critics, n_quantiles)
+                                all_q = next_q_values.reshape(batch_size, -1)
+                                sorted_q, _ = torch.sort(all_q, dim=1)
+                                n_critics = next_q_values.shape[1]
+                                n_drop = getattr(self, 'top_quantiles_to_drop_per_net', 0) * n_critics
+                                n_target = sorted_q.shape[1] - n_drop
+                                if n_target > 0:
+                                    sorted_q = sorted_q[:, :n_target]
+                                next_q = sorted_q.mean(dim=1, keepdim=True)
+                            else:
+                                next_q = next_q_values
 
-                    target_q = replay_data.rewards + (
-                        1 - replay_data.dones
-                    ) * self.gamma * (next_q - ent_coef * next_log_prob)
+                        target_q = replay_data.rewards + (
+                            1 - replay_data.dones
+                        ) * self.gamma * (next_q - ent_coef * next_log_prob)
 
-                # Current Q-values
-                _qc = _get_tqc_quantile_critics(self.critic)
-                if _qc is not None:
-                    current_quantiles = []
-                    features = self.critic.features_extractor(
-                        replay_data.observations
-                    )
-                    x = torch.cat([features, replay_data.actions], dim=-1)
-                    for critic_net in _qc:
-                        current_quantiles.append(critic_net(x))
-                    # Quantile Huber loss
-                    critic_loss = 0.0
-                    n_quantiles = current_quantiles[0].shape[1]
-                    tau = (torch.arange(n_quantiles, device=self.device, dtype=torch.float32) + 0.5) / n_quantiles
-                    for current_q in current_quantiles:
-                        # (batch, n_quantiles, 1) - (batch, 1, 1) -> (batch, n_quantiles, 1)
-                        td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
-                        huber = F.smooth_l1_loss(current_q.unsqueeze(2),
-                                                 target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
-                                                 reduction='none')
-                        quantile_loss = torch.abs(tau.view(1, -1, 1) - (td_error < 0).float()) * huber
-                        critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
-                else:
-                    # SAC or TQC with forward()-based access
-                    current_q_raw = self.critic(
-                        replay_data.observations, replay_data.actions
-                    )
-                    if isinstance(current_q_raw, (list, tuple)):
-                        current_q_list = list(current_q_raw)
-                    elif current_q_raw.dim() == 3:
-                        current_q_list = [current_q_raw[:, i, :] for i in range(current_q_raw.shape[1])]
-                    else:
-                        current_q_list = None
-
-                    if current_q_list is not None and current_q_list[0].shape[-1] > 1:
-                        # TQC quantile Huber loss via forward()
+                    # Current Q-values
+                    _qc = _get_tqc_quantile_critics(self.critic)
+                    if _qc is not None:
+                        current_quantiles = []
+                        features = self.critic.features_extractor(
+                            replay_data.observations
+                        )
+                        x = torch.cat([features, replay_data.actions], dim=-1)
+                        for critic_net in _qc:
+                            current_quantiles.append(critic_net(x))
+                        # Quantile Huber loss
                         critic_loss = 0.0
-                        n_quantiles = current_q_list[0].shape[-1]
+                        n_quantiles = current_quantiles[0].shape[1]
                         tau = (torch.arange(n_quantiles, device=self.device, dtype=torch.float32) + 0.5) / n_quantiles
-                        for current_q in current_q_list:
+                        for current_q in current_quantiles:
                             td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
                             huber = F.smooth_l1_loss(current_q.unsqueeze(2),
                                                      target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
@@ -948,11 +947,35 @@ def _create_safe_tqc_class(tqc_base_cls):
                             quantile_loss = torch.abs(tau.view(1, -1, 1) - (td_error < 0).float()) * huber
                             critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
                     else:
-                        # SAC MSE loss
-                        if current_q_list is not None:
-                            critic_loss = sum(F.mse_loss(q, target_q) for q in current_q_list)
+                        # SAC or TQC with forward()-based access
+                        current_q_raw = self.critic(
+                            replay_data.observations, replay_data.actions
+                        )
+                        if isinstance(current_q_raw, (list, tuple)):
+                            current_q_list = list(current_q_raw)
+                        elif current_q_raw.dim() == 3:
+                            current_q_list = [current_q_raw[:, i, :] for i in range(current_q_raw.shape[1])]
                         else:
-                            critic_loss = F.mse_loss(current_q_raw, target_q)
+                            current_q_list = None
+
+                        if current_q_list is not None and current_q_list[0].shape[-1] > 1:
+                            # TQC quantile Huber loss via forward()
+                            critic_loss = 0.0
+                            n_quantiles = current_q_list[0].shape[-1]
+                            tau = (torch.arange(n_quantiles, device=self.device, dtype=torch.float32) + 0.5) / n_quantiles
+                            for current_q in current_q_list:
+                                td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
+                                huber = F.smooth_l1_loss(current_q.unsqueeze(2),
+                                                         target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
+                                                         reduction='none')
+                                quantile_loss = torch.abs(tau.view(1, -1, 1) - (td_error < 0).float()) * huber
+                                critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
+                        else:
+                            # SAC MSE loss
+                            if current_q_list is not None:
+                                critic_loss = sum(F.mse_loss(q, target_q) for q in current_q_list)
+                            else:
+                                critic_loss = F.mse_loss(current_q_raw, target_q)
 
                 critic_losses.append(critic_loss.item())
 
@@ -985,49 +1008,73 @@ def _create_safe_tqc_class(tqc_base_cls):
                     cost_critic_loss.backward()
                     self.cost_critic_optimizer.step()
 
-                # --- Actor update ---
-                # Q-values for current actions
-                _qc_actor = _get_tqc_quantile_critics(self.critic)
-                if _qc_actor is not None:
-                    q_values = []
-                    features_pi = self.critic.features_extractor(
+                # --- Actor + entropy update (gated by policy_delay for CrossQ) ---
+                if self._n_updates % policy_delay == 0 or not is_crossq:
+                    _set_bn_mode(self.actor, True)
+                    actions_pi, log_prob = self.actor.action_log_prob(
                         replay_data.observations
                     )
-                    x_pi = torch.cat([features_pi, actions_pi], dim=-1)
-                    for critic_net in _qc_actor:
-                        q_values.append(critic_net(x_pi).mean(dim=1, keepdim=True))
-                    qf_pi = torch.cat(q_values, dim=1).mean(dim=1, keepdim=True)
-                else:
-                    # Fallback: use critic forward()
-                    q_pi_raw = self.critic(replay_data.observations, actions_pi)
-                    if isinstance(q_pi_raw, (list, tuple)):
+                    log_prob = log_prob.reshape(-1, 1)
+                    _set_bn_mode(self.actor, False)
+
+                    # Entropy coefficient update
+                    ent_coef_loss = -(
+                        self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                    ).mean()
+                    ent_coef_losses.append(ent_coef_loss.item())
+
+                    self.ent_coef_optimizer.zero_grad()
+                    ent_coef_loss.backward()
+                    self.ent_coef_optimizer.step()
+
+                    # Q-values for current actions
+                    _qc_actor = _get_tqc_quantile_critics(self.critic)
+                    if is_crossq:
+                        _set_bn_mode(self.critic, False)
+                        q_pi_values = self.critic(replay_data.observations, actions_pi)
                         qf_pi = torch.min(
-                            torch.cat(q_pi_raw, dim=1), dim=1, keepdim=True
+                            torch.cat(q_pi_values, dim=1), dim=1, keepdim=True
                         )[0]
-                    elif q_pi_raw.dim() == 3:
-                        # TQC stacked: average over quantiles, then mean over critics
-                        qf_pi = q_pi_raw.mean(dim=2).mean(dim=1, keepdim=True)
+                    elif _qc_actor is not None:
+                        q_values = []
+                        features_pi = self.critic.features_extractor(
+                            replay_data.observations
+                        )
+                        x_pi = torch.cat([features_pi, actions_pi], dim=-1)
+                        for critic_net in _qc_actor:
+                            q_values.append(critic_net(x_pi).mean(dim=1, keepdim=True))
+                        qf_pi = torch.cat(q_values, dim=1).mean(dim=1, keepdim=True)
                     else:
-                        qf_pi = q_pi_raw
+                        # Fallback: use critic forward()
+                        q_pi_raw = self.critic(replay_data.observations, actions_pi)
+                        if isinstance(q_pi_raw, (list, tuple)):
+                            qf_pi = torch.min(
+                                torch.cat(q_pi_raw, dim=1), dim=1, keepdim=True
+                            )[0]
+                        elif q_pi_raw.dim() == 3:
+                            # TQC stacked: average over quantiles, then mean over critics
+                            qf_pi = q_pi_raw.mean(dim=2).mean(dim=1, keepdim=True)
+                        else:
+                            qf_pi = q_pi_raw
 
-                # Lagrange-penalized actor loss
-                lagrange = F.softplus(self.log_lagrange).detach()
-                if cost_data is not None:
-                    cost_q_values = self.cost_critic(
-                        replay_data.observations, actions_pi
-                    )
-                    qc_pi = torch.min(
-                        torch.cat(cost_q_values, dim=1), dim=1, keepdim=True
-                    )[0]
-                    actor_loss = (ent_coef * log_prob - qf_pi + lagrange * qc_pi).mean()
-                else:
-                    actor_loss = (ent_coef * log_prob - qf_pi).mean()
+                    # Lagrange-penalized actor loss
+                    lagrange = F.softplus(self.log_lagrange).detach()
+                    if cost_data is not None:
+                        cost_q_values = self.cost_critic(
+                            replay_data.observations, actions_pi
+                        )
+                        qc_pi = torch.min(
+                            torch.cat(cost_q_values, dim=1), dim=1, keepdim=True
+                        )[0]
+                        actor_loss = (ent_coef * log_prob - qf_pi + lagrange * qc_pi).mean()
+                    else:
+                        actor_loss = (ent_coef * log_prob - qf_pi).mean()
 
-                actor_losses.append(actor_loss.item())
+                    actor_losses.append(actor_loss.item())
 
-                self.actor.optimizer.zero_grad()
-                actor_loss.backward()
-                self.actor.optimizer.step()
+                    self.actor.optimizer.zero_grad()
+                    actor_loss.backward()
+                    self.actor.optimizer.step()
 
                 # --- Lagrange multiplier update ---
                 if cost_data is not None:
@@ -1059,10 +1106,12 @@ def _create_safe_tqc_class(tqc_base_cls):
                     )
 
             # Logging
-            self._n_updates += gradient_steps
+            if not is_crossq:
+                self._n_updates += gradient_steps
             self.logger.record("train/n_updates", self._n_updates)
             self.logger.record("train/ent_coef", np.mean(ent_coefs))
-            self.logger.record("train/actor_loss", np.mean(actor_losses))
+            if actor_losses:
+                self.logger.record("train/actor_loss", np.mean(actor_losses))
             self.logger.record("train/critic_loss", np.mean(critic_losses))
             if ent_coef_losses:
                 self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
@@ -1203,6 +1252,8 @@ def _create_dual_policy_class(base_cls):
 
             # Switch to train mode
             self.policy.set_training_mode(True)
+            is_crossq = _is_crossq_model(self)
+            policy_delay = getattr(self, 'policy_delay', 1)
 
             # Update learning rate
             self._update_learning_rate(
@@ -1214,27 +1265,16 @@ def _create_dual_policy_class(base_cls):
             il_selection_rates = []
 
             for _ in range(gradient_steps):
+                if is_crossq:
+                    self._n_updates += 1
+
                 # Sample replay buffer
                 replay_data = self.replay_buffer.sample(
                     batch_size, env=self._vec_normalize_env
                 )
 
-                # --- Entropy coefficient update ---
-                actions_pi, log_prob = self.actor.action_log_prob(
-                    replay_data.observations
-                )
-                log_prob = log_prob.reshape(-1, 1)
-
+                # Read ent_coef before critic update (no actor forward pass yet)
                 ent_coef = torch.exp(self.log_ent_coef.detach())
-                ent_coef_loss = -(
-                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
-                ).mean()
-                ent_coef_losses.append(ent_coef_loss.item())
-
-                self.ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                self.ent_coef_optimizer.step()
-
                 ent_coefs.append(ent_coef.item())
 
                 # --- IBRL TD target ---
@@ -1243,6 +1283,7 @@ def _create_dual_policy_class(base_cls):
                     B = next_obs.shape[0]
 
                     # RL next action + log prob
+                    _set_bn_mode(self.actor, False)
                     next_actions_rl, next_log_prob_rl = self.actor.action_log_prob(
                         next_obs
                     )
@@ -1253,149 +1294,192 @@ def _create_dual_policy_class(base_cls):
                         next_obs, deterministic=True
                     )
 
-                    _critic_for_target = getattr(self, 'critic_target', None) or self.critic
-                    _qc_target = _get_tqc_quantile_critics(_critic_for_target)
-                    if _qc_target is not None:
-                        # TQC quantile path: compute features once, reuse
-                        feats = _critic_for_target.features_extractor(next_obs)
-                        x_rl = torch.cat([feats, next_actions_rl], dim=-1)
-                        x_il = torch.cat([feats, next_actions_il], dim=-1)
+                if is_crossq:
+                    # CrossQ 3x-batch joint forward pass: BatchRenorm sees
+                    # obs + next_obs(RL) + next_obs(IL) mixture distribution
+                    with torch.no_grad():
+                        # Compute IBRL max(Q_RL_adj, Q_IL) for TD targets
+                        # Use separate forward for target computation (detached)
+                        next_q_rl_raw = self.critic(next_obs, next_actions_rl)
+                        next_q_il_raw = self.critic(next_obs, next_actions_il)
 
-                        q_rl_all = torch.stack(
-                            [cn(x_rl) for cn in _qc_target], dim=1
-                        )  # (B, n_critics, n_q)
-                        q_il_all = torch.stack(
-                            [cn(x_il) for cn in _qc_target], dim=1
-                        )
-
-                        # Scalar comparison (mean over quantiles, min over critics)
-                        q_rl_scalar = q_rl_all.mean(dim=2).min(dim=1).values  # (B,)
-                        q_il_scalar = q_il_all.mean(dim=2).min(dim=1).values
-
-                        q_rl_adj_scalar = (
-                            q_rl_scalar - (ent_coef * next_log_prob_rl).squeeze(1)
-                        )
-                        use_il = q_il_scalar > q_rl_adj_scalar  # (B,) bool
-                        il_selection_rates.append(use_il.float().mean().item())
-
-                        # Per-sample selection over full quantile distributions
-                        q_rl_flat = q_rl_all.reshape(B, -1)   # (B, n_critics*n_q)
-                        q_il_flat = q_il_all.reshape(B, -1)
-                        # entropy adjustment broadcasts over quantile dim
-                        q_rl_adj_flat = q_rl_flat - ent_coef * next_log_prob_rl
-
-                        q_next_flat = torch.where(
-                            use_il.unsqueeze(1), q_il_flat, q_rl_adj_flat
-                        )
-
-                        # Sort + drop top quantiles (same as SafeTQC)
-                        sorted_q, _ = torch.sort(q_next_flat, dim=1)
-                        n_target = (
-                            sorted_q.shape[1]
-                            - self.top_quantiles_to_drop_per_net * len(_qc_target)
-                        )
-                        if n_target > 0:
-                            sorted_q = sorted_q[:, :n_target]
-                        next_q = sorted_q.mean(dim=1, keepdim=True)
-
-                    else:
-                        # SAC/CrossQ scalar path
-                        next_q_rl = _critic_for_target(next_obs, next_actions_rl)
-                        next_q_il = _critic_for_target(next_obs, next_actions_il)
-
-                        def _min_q(q_raw):
+                        def _min_q_crossq(q_raw):
                             if isinstance(q_raw, (list, tuple)):
                                 return torch.min(
                                     torch.cat(q_raw, dim=1), dim=1, keepdim=True
                                 )[0]
                             return q_raw
 
-                        q_rl_adj = _min_q(next_q_rl) - ent_coef * next_log_prob_rl
-                        q_il_v = _min_q(next_q_il)
+                        q_rl_adj = _min_q_crossq(next_q_rl_raw) - ent_coef * next_log_prob_rl
+                        q_il_v = _min_q_crossq(next_q_il_raw)
                         next_q = torch.max(q_rl_adj, q_il_v)
 
                         use_il = (q_il_v > q_rl_adj).squeeze(1)
                         il_selection_rates.append(use_il.float().mean().item())
 
-                    target_q = replay_data.rewards + (
-                        1 - replay_data.dones
-                    ) * self.gamma * next_q
+                        target_q = replay_data.rewards + (
+                            1 - replay_data.dones
+                        ) * self.gamma * next_q
 
-                # --- Current Q-values + critic loss ---
-                _qc = _get_tqc_quantile_critics(self.critic)
-                if _qc is not None:
-                    current_quantiles = []
-                    features = self.critic.features_extractor(
-                        replay_data.observations
+                    # Joint forward pass through critic with BN training mode
+                    all_obs = torch.cat([replay_data.observations, next_obs, next_obs], dim=0)
+                    all_actions = torch.cat([replay_data.actions, next_actions_rl, next_actions_il], dim=0)
+                    _set_bn_mode(self.critic, True)
+                    all_q_values = torch.cat(
+                        self.critic(all_obs, all_actions), dim=1
+                    )  # (3*B, n_critics)
+                    _set_bn_mode(self.critic, False)
+                    current_q_values = all_q_values[:B]  # first B rows = current obs
+                    critic_loss = 0.5 * sum(
+                        F.mse_loss(current_q_values[:, i:i+1], target_q)
+                        for i in range(current_q_values.shape[1])
                     )
-                    x = torch.cat([features, replay_data.actions], dim=-1)
-                    for critic_net in _qc:
-                        current_quantiles.append(critic_net(x))
-                    critic_loss = 0.0
-                    n_quantiles = current_quantiles[0].shape[1]
-                    tau = (
-                        torch.arange(
-                            n_quantiles, device=self.device, dtype=torch.float32
-                        ) + 0.5
-                    ) / n_quantiles
-                    for current_q in current_quantiles:
-                        td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
-                        huber = F.smooth_l1_loss(
-                            current_q.unsqueeze(2),
-                            target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
-                            reduction='none',
-                        )
-                        quantile_loss = (
-                            torch.abs(tau.view(1, -1, 1) - (td_error < 0).float())
-                            * huber
-                        )
-                        critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
                 else:
-                    current_q_raw = self.critic(
-                        replay_data.observations, replay_data.actions
-                    )
-                    if isinstance(current_q_raw, (list, tuple)):
-                        current_q_list = list(current_q_raw)
-                    elif current_q_raw.dim() == 3:
-                        current_q_list = [
-                            current_q_raw[:, i, :]
-                            for i in range(current_q_raw.shape[1])
-                        ]
-                    else:
-                        current_q_list = None
+                    # TQC/SAC: separate forward passes (existing code)
+                    with torch.no_grad():
+                        _critic_for_target = getattr(self, 'critic_target', None) or self.critic
+                        _qc_target = _get_tqc_quantile_critics(_critic_for_target)
+                        if _qc_target is not None:
+                            # TQC quantile path: compute features once, reuse
+                            feats = _critic_for_target.features_extractor(next_obs)
+                            x_rl = torch.cat([feats, next_actions_rl], dim=-1)
+                            x_il = torch.cat([feats, next_actions_il], dim=-1)
 
-                    if current_q_list is not None and current_q_list[0].shape[-1] > 1:
+                            q_rl_all = torch.stack(
+                                [cn(x_rl) for cn in _qc_target], dim=1
+                            )  # (B, n_critics, n_q)
+                            q_il_all = torch.stack(
+                                [cn(x_il) for cn in _qc_target], dim=1
+                            )
+
+                            # Scalar comparison (mean over quantiles, min over critics)
+                            q_rl_scalar = q_rl_all.mean(dim=2).min(dim=1).values  # (B,)
+                            q_il_scalar = q_il_all.mean(dim=2).min(dim=1).values
+
+                            q_rl_adj_scalar = (
+                                q_rl_scalar - (ent_coef * next_log_prob_rl).squeeze(1)
+                            )
+                            use_il = q_il_scalar > q_rl_adj_scalar  # (B,) bool
+                            il_selection_rates.append(use_il.float().mean().item())
+
+                            # Per-sample selection over full quantile distributions
+                            q_rl_flat = q_rl_all.reshape(B, -1)   # (B, n_critics*n_q)
+                            q_il_flat = q_il_all.reshape(B, -1)
+                            # entropy adjustment broadcasts over quantile dim
+                            q_rl_adj_flat = q_rl_flat - ent_coef * next_log_prob_rl
+
+                            q_next_flat = torch.where(
+                                use_il.unsqueeze(1), q_il_flat, q_rl_adj_flat
+                            )
+
+                            # Sort + drop top quantiles (same as SafeTQC)
+                            sorted_q, _ = torch.sort(q_next_flat, dim=1)
+                            n_target = (
+                                sorted_q.shape[1]
+                                - self.top_quantiles_to_drop_per_net * len(_qc_target)
+                            )
+                            if n_target > 0:
+                                sorted_q = sorted_q[:, :n_target]
+                            next_q = sorted_q.mean(dim=1, keepdim=True)
+
+                        else:
+                            # SAC scalar path
+                            next_q_rl = _critic_for_target(next_obs, next_actions_rl)
+                            next_q_il = _critic_for_target(next_obs, next_actions_il)
+
+                            def _min_q(q_raw):
+                                if isinstance(q_raw, (list, tuple)):
+                                    return torch.min(
+                                        torch.cat(q_raw, dim=1), dim=1, keepdim=True
+                                    )[0]
+                                return q_raw
+
+                            q_rl_adj = _min_q(next_q_rl) - ent_coef * next_log_prob_rl
+                            q_il_v = _min_q(next_q_il)
+                            next_q = torch.max(q_rl_adj, q_il_v)
+
+                            use_il = (q_il_v > q_rl_adj).squeeze(1)
+                            il_selection_rates.append(use_il.float().mean().item())
+
+                        target_q = replay_data.rewards + (
+                            1 - replay_data.dones
+                        ) * self.gamma * next_q
+
+                    # --- Current Q-values + critic loss ---
+                    _qc = _get_tqc_quantile_critics(self.critic)
+                    if _qc is not None:
+                        current_quantiles = []
+                        features = self.critic.features_extractor(
+                            replay_data.observations
+                        )
+                        x = torch.cat([features, replay_data.actions], dim=-1)
+                        for critic_net in _qc:
+                            current_quantiles.append(critic_net(x))
                         critic_loss = 0.0
-                        n_quantiles = current_q_list[0].shape[-1]
+                        n_quantiles = current_quantiles[0].shape[1]
                         tau = (
                             torch.arange(
                                 n_quantiles, device=self.device, dtype=torch.float32
                             ) + 0.5
                         ) / n_quantiles
-                        for current_q in current_q_list:
+                        for current_q in current_quantiles:
                             td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
                             huber = F.smooth_l1_loss(
                                 current_q.unsqueeze(2),
-                                target_q.unsqueeze(1).expand_as(
-                                    current_q.unsqueeze(2)
-                                ),
+                                target_q.unsqueeze(1).expand_as(current_q.unsqueeze(2)),
                                 reduction='none',
                             )
                             quantile_loss = (
-                                torch.abs(
-                                    tau.view(1, -1, 1) - (td_error < 0).float()
-                                ) * huber
+                                torch.abs(tau.view(1, -1, 1) - (td_error < 0).float())
+                                * huber
                             )
-                            critic_loss = (
-                                critic_loss + quantile_loss.sum(dim=1).mean()
-                            )
+                            critic_loss = critic_loss + quantile_loss.sum(dim=1).mean()
                     else:
-                        if current_q_list is not None:
-                            critic_loss = sum(
-                                F.mse_loss(q, target_q) for q in current_q_list
-                            )
+                        current_q_raw = self.critic(
+                            replay_data.observations, replay_data.actions
+                        )
+                        if isinstance(current_q_raw, (list, tuple)):
+                            current_q_list = list(current_q_raw)
+                        elif current_q_raw.dim() == 3:
+                            current_q_list = [
+                                current_q_raw[:, i, :]
+                                for i in range(current_q_raw.shape[1])
+                            ]
                         else:
-                            critic_loss = F.mse_loss(current_q_raw, target_q)
+                            current_q_list = None
+
+                        if current_q_list is not None and current_q_list[0].shape[-1] > 1:
+                            critic_loss = 0.0
+                            n_quantiles = current_q_list[0].shape[-1]
+                            tau = (
+                                torch.arange(
+                                    n_quantiles, device=self.device, dtype=torch.float32
+                                ) + 0.5
+                            ) / n_quantiles
+                            for current_q in current_q_list:
+                                td_error = target_q.unsqueeze(1) - current_q.unsqueeze(2)
+                                huber = F.smooth_l1_loss(
+                                    current_q.unsqueeze(2),
+                                    target_q.unsqueeze(1).expand_as(
+                                        current_q.unsqueeze(2)
+                                    ),
+                                    reduction='none',
+                                )
+                                quantile_loss = (
+                                    torch.abs(
+                                        tau.view(1, -1, 1) - (td_error < 0).float()
+                                    ) * huber
+                                )
+                                critic_loss = (
+                                    critic_loss + quantile_loss.sum(dim=1).mean()
+                                )
+                        else:
+                            if current_q_list is not None:
+                                critic_loss = sum(
+                                    F.mse_loss(q, target_q) for q in current_q_list
+                                )
+                            else:
+                                critic_loss = F.mse_loss(current_q_raw, target_q)
 
                 critic_losses.append(critic_loss.item())
 
@@ -1403,34 +1487,59 @@ def _create_dual_policy_class(base_cls):
                 critic_loss.backward()
                 self.critic.optimizer.step()
 
-                # --- Actor update ---
-                _qc_actor = _get_tqc_quantile_critics(self.critic)
-                if _qc_actor is not None:
-                    q_values = []
-                    features_pi = self.critic.features_extractor(
+                # --- Actor + entropy update (gated by policy_delay for CrossQ) ---
+                if self._n_updates % policy_delay == 0 or not is_crossq:
+                    _set_bn_mode(self.actor, True)
+                    actions_pi, log_prob = self.actor.action_log_prob(
                         replay_data.observations
                     )
-                    x_pi = torch.cat([features_pi, actions_pi], dim=-1)
-                    for critic_net in _qc_actor:
-                        q_values.append(critic_net(x_pi).mean(dim=1, keepdim=True))
-                    qf_pi = torch.cat(q_values, dim=1).mean(dim=1, keepdim=True)
-                else:
-                    q_pi_raw = self.critic(replay_data.observations, actions_pi)
-                    if isinstance(q_pi_raw, (list, tuple)):
+                    log_prob = log_prob.reshape(-1, 1)
+                    _set_bn_mode(self.actor, False)
+
+                    # Entropy coefficient update
+                    ent_coef_loss = -(
+                        self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                    ).mean()
+                    ent_coef_losses.append(ent_coef_loss.item())
+
+                    self.ent_coef_optimizer.zero_grad()
+                    ent_coef_loss.backward()
+                    self.ent_coef_optimizer.step()
+
+                    # Q-values for current actions
+                    _qc_actor = _get_tqc_quantile_critics(self.critic)
+                    if is_crossq:
+                        _set_bn_mode(self.critic, False)
+                        q_pi_values = self.critic(replay_data.observations, actions_pi)
                         qf_pi = torch.min(
-                            torch.cat(q_pi_raw, dim=1), dim=1, keepdim=True
+                            torch.cat(q_pi_values, dim=1), dim=1, keepdim=True
                         )[0]
-                    elif q_pi_raw.dim() == 3:
-                        qf_pi = q_pi_raw.mean(dim=2).mean(dim=1, keepdim=True)
+                    elif _qc_actor is not None:
+                        q_values = []
+                        features_pi = self.critic.features_extractor(
+                            replay_data.observations
+                        )
+                        x_pi = torch.cat([features_pi, actions_pi], dim=-1)
+                        for critic_net in _qc_actor:
+                            q_values.append(critic_net(x_pi).mean(dim=1, keepdim=True))
+                        qf_pi = torch.cat(q_values, dim=1).mean(dim=1, keepdim=True)
                     else:
-                        qf_pi = q_pi_raw
+                        q_pi_raw = self.critic(replay_data.observations, actions_pi)
+                        if isinstance(q_pi_raw, (list, tuple)):
+                            qf_pi = torch.min(
+                                torch.cat(q_pi_raw, dim=1), dim=1, keepdim=True
+                            )[0]
+                        elif q_pi_raw.dim() == 3:
+                            qf_pi = q_pi_raw.mean(dim=2).mean(dim=1, keepdim=True)
+                        else:
+                            qf_pi = q_pi_raw
 
-                actor_loss = (ent_coef * log_prob - qf_pi).mean()
-                actor_losses.append(actor_loss.item())
+                    actor_loss = (ent_coef * log_prob - qf_pi).mean()
+                    actor_losses.append(actor_loss.item())
 
-                self.actor.optimizer.zero_grad()
-                actor_loss.backward()
-                self.actor.optimizer.step()
+                    self.actor.optimizer.zero_grad()
+                    actor_loss.backward()
+                    self.actor.optimizer.step()
 
                 # --- Target network update ---
                 if hasattr(self, 'critic_target') and self.critic_target is not None:
@@ -1441,10 +1550,12 @@ def _create_dual_policy_class(base_cls):
                     )
 
             # Logging
-            self._n_updates += gradient_steps
+            if not is_crossq:
+                self._n_updates += gradient_steps
             self.logger.record("train/n_updates", self._n_updates)
             self.logger.record("train/ent_coef", np.mean(ent_coefs))
-            self.logger.record("train/actor_loss", np.mean(actor_losses))
+            if actor_losses:
+                self.logger.record("train/actor_loss", np.mean(actor_losses))
             self.logger.record("train/critic_loss", np.mean(critic_losses))
             if ent_coef_losses:
                 self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))

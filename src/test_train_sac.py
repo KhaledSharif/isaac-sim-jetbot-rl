@@ -56,6 +56,7 @@ from train_sac import (
     inject_layernorm_into_critics,
     _apply_gru_lr,
     _is_crossq_model,
+    _set_bn_mode,
     symlog,
     ChunkCVAEFeatureExtractor,
     TemporalCVAEFeatureExtractor,
@@ -2021,4 +2022,313 @@ class TestCrossQCompatibility:
             chunk_size=chunk_size, z_dim=z_dim,
             epochs=2, batch_size=32, lr=1e-3, beta=0.1,
         )
+        vec_env.close()
+
+    def test_set_bn_mode_with_method(self):
+        """_set_bn_mode calls set_bn_training_mode when available."""
+        module = Mock()
+        module.set_bn_training_mode = Mock()
+        _set_bn_mode(module, False)
+        module.set_bn_training_mode.assert_called_once_with(False)
+        _set_bn_mode(module, True)
+        module.set_bn_training_mode.assert_called_with(True)
+
+    def test_set_bn_mode_without_method(self):
+        """_set_bn_mode is a no-op when set_bn_training_mode is absent."""
+        import torch.nn as nn
+        module = nn.Linear(10, 10)  # plain module, no set_bn_training_mode
+        # Should not raise
+        _set_bn_mode(module, True)
+        _set_bn_mode(module, False)
+
+    def test_safe_tqc_crossq_joint_forward(self):
+        """SafeTQC(CrossQ).train() calls critic with 2*B batch for joint forward."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+        chunk_size = 5
+        z_dim = 8
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(chunk_size * 2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=z_dim)
+        features_dim = 96 + z_dim
+        policy_kwargs = dict(
+            net_arch=dict(pi=[64, 64], qf=[64, 64]),
+            activation_fn=torch.nn.ReLU,
+            features_extractor_class=fe_cls,
+            features_extractor_kwargs=dict(features_dim=features_dim),
+        )
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        SafeTQC = _create_safe_tqc_class(CrossQ)
+        model = SafeTQC(
+            "MlpPolicy", vec_env, device='cpu', seed=42,
+            policy_kwargs=policy_kwargs,
+            cost_limit=25.0, lagrange_lr=3e-4,
+        )
+
+        # Set up logger so _update_learning_rate works
+        from stable_baselines3.common.logger import configure as configure_logger
+        model.set_logger(configure_logger(None, ["stdout"]))
+
+        # Fill replay buffer with a small batch so training can proceed
+        from stable_baselines3.common.buffers import ReplayBuffer
+        model.replay_buffer = ReplayBuffer(
+            100, model.observation_space, model.action_space, device='cpu'
+        )
+        for _ in range(20):
+            obs = np.random.randn(34).astype(np.float32)
+            next_obs = np.random.randn(34).astype(np.float32)
+            action = np.random.randn(chunk_size * 2).astype(np.float32)
+            model.replay_buffer.add(obs, next_obs, action, 1.0, False, [{}])
+
+        # Spy on critic forward to check batch sizes
+        original_forward = model.critic.forward
+        call_sizes = []
+        def _spy_forward(obs, actions):
+            call_sizes.append(obs.shape[0])
+            return original_forward(obs, actions)
+        model.critic.forward = _spy_forward
+
+        batch_size = 8
+        model.train(gradient_steps=1, batch_size=batch_size)
+
+        # CrossQ joint forward should produce a 2*B call (obs + next_obs)
+        assert any(s == 2 * batch_size for s in call_sizes), \
+            f"Expected a 2*B={2*batch_size} critic call, got sizes: {call_sizes}"
+        vec_env.close()
+
+    def test_safe_tqc_crossq_policy_delay(self):
+        """SafeTQC(CrossQ) respects policy_delay — actor skipped when not due."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+        from stable_baselines3.common.buffers import ReplayBuffer
+
+        chunk_size = 5
+        z_dim = 8
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(chunk_size * 2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=z_dim)
+        features_dim = 96 + z_dim
+        policy_kwargs = dict(
+            net_arch=dict(pi=[64, 64], qf=[64, 64]),
+            activation_fn=torch.nn.ReLU,
+            features_extractor_class=fe_cls,
+            features_extractor_kwargs=dict(features_dim=features_dim),
+        )
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        SafeTQC = _create_safe_tqc_class(CrossQ)
+        model = SafeTQC(
+            "MlpPolicy", vec_env, device='cpu', seed=42,
+            policy_kwargs=policy_kwargs,
+            cost_limit=25.0,
+        )
+        from stable_baselines3.common.logger import configure as configure_logger
+        model.set_logger(configure_logger(None, ["stdout"]))
+        model.policy_delay = 3  # actor updates every 3rd gradient step
+
+        model.replay_buffer = ReplayBuffer(
+            100, model.observation_space, model.action_space, device='cpu'
+        )
+        for _ in range(20):
+            obs = np.random.randn(34).astype(np.float32)
+            next_obs = np.random.randn(34).astype(np.float32)
+            action = np.random.randn(chunk_size * 2).astype(np.float32)
+            model.replay_buffer.add(obs, next_obs, action, 1.0, False, [{}])
+
+        # Record actor optimizer steps
+        original_step = model.actor.optimizer.step
+        actor_step_count = [0]
+        def _count_step(*args, **kwargs):
+            actor_step_count[0] += 1
+            return original_step(*args, **kwargs)
+        model.actor.optimizer.step = _count_step
+
+        # Reset _n_updates to 0 for predictable counting
+        model._n_updates = 0
+
+        # Run 6 gradient steps with policy_delay=3 → actor should update at steps 3 and 6
+        model.train(gradient_steps=6, batch_size=8)
+        assert actor_step_count[0] == 2, \
+            f"Expected 2 actor updates (delay=3, steps=6), got {actor_step_count[0]}"
+        vec_env.close()
+
+    def test_dual_policy_crossq_triple_batch(self):
+        """DualPolicy(CrossQ).train() calls critic with 3*B batch for joint forward."""
+        try:
+            from sb3_contrib import CrossQ
+        except ImportError:
+            pytest.skip("sb3-contrib CrossQ not available")
+
+        import copy
+        import torch
+        import gymnasium as gym
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+        from stable_baselines3.common.buffers import ReplayBuffer
+
+        chunk_size = 5
+        z_dim = 8
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(chunk_size * 2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=z_dim)
+        features_dim = 96 + z_dim
+        policy_kwargs = dict(
+            net_arch=dict(pi=[64, 64], qf=[64, 64]),
+            activation_fn=torch.nn.ReLU,
+            features_extractor_class=fe_cls,
+            features_extractor_kwargs=dict(features_dim=features_dim),
+        )
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        DualPolicyTQC = _create_dual_policy_class(CrossQ)
+        model = DualPolicyTQC(
+            "MlpPolicy", vec_env, device='cpu', seed=42,
+            policy_kwargs=policy_kwargs,
+        )
+        from stable_baselines3.common.logger import configure as configure_logger
+        model.set_logger(configure_logger(None, ["stdout"]))
+        # Set up frozen IL actor (triggers IBRL train path)
+        model.il_actor = copy.deepcopy(model.actor)
+        model.il_actor.requires_grad_(False)
+
+        model.replay_buffer = ReplayBuffer(
+            100, model.observation_space, model.action_space, device='cpu'
+        )
+        for _ in range(20):
+            obs = np.random.randn(34).astype(np.float32)
+            next_obs = np.random.randn(34).astype(np.float32)
+            action = np.random.randn(chunk_size * 2).astype(np.float32)
+            model.replay_buffer.add(obs, next_obs, action, 1.0, False, [{}])
+
+        # Spy on critic forward to check batch sizes
+        original_forward = model.critic.forward
+        call_sizes = []
+        def _spy_forward(obs, actions):
+            call_sizes.append(obs.shape[0])
+            return original_forward(obs, actions)
+        model.critic.forward = _spy_forward
+
+        batch_size = 8
+        model.train(gradient_steps=1, batch_size=batch_size)
+
+        # CrossQ IBRL joint forward should produce a 3*B call
+        assert any(s == 3 * batch_size for s in call_sizes), \
+            f"Expected a 3*B={3*batch_size} critic call, got sizes: {call_sizes}"
+        vec_env.close()
+
+    def test_safe_tqc_tqc_backward_compat(self):
+        """SafeTQC(SAC) uses separate forward passes (TQC/SAC backward compat)."""
+        import torch
+        import gymnasium as gym
+        from stable_baselines3 import SAC
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+        from stable_baselines3.common.buffers import ReplayBuffer
+
+        chunk_size = 5
+        z_dim = 8
+
+        class _FakeEnv(gym.Env):
+            def __init__(self):
+                super().__init__()
+                self.observation_space = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32)
+                self.action_space = gym.spaces.Box(
+                    low=-1.0, high=1.0, shape=(chunk_size * 2,), dtype=np.float32)
+            def reset(self, **kwargs):
+                return np.zeros(34, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(34, dtype=np.float32), 0.0, False, False, {}
+
+        fe_cls = ChunkCVAEFeatureExtractor.get_class(BaseFeaturesExtractor, z_dim=z_dim)
+        features_dim = 96 + z_dim
+        policy_kwargs = dict(
+            net_arch=dict(pi=[64, 64], qf=[64, 64]),
+            activation_fn=torch.nn.ReLU,
+            features_extractor_class=fe_cls,
+            features_extractor_kwargs=dict(features_dim=features_dim),
+        )
+
+        vec_env = DummyVecEnv([_FakeEnv])
+        SafeTQC = _create_safe_tqc_class(SAC)
+        model = SafeTQC(
+            "MlpPolicy", vec_env, device='cpu', seed=42,
+            policy_kwargs=policy_kwargs,
+            cost_limit=25.0,
+        )
+        from stable_baselines3.common.logger import configure as configure_logger
+        model.set_logger(configure_logger(None, ["stdout"]))
+
+        model.replay_buffer = ReplayBuffer(
+            100, model.observation_space, model.action_space, device='cpu'
+        )
+        for _ in range(20):
+            obs = np.random.randn(34).astype(np.float32)
+            next_obs = np.random.randn(34).astype(np.float32)
+            action = np.random.randn(chunk_size * 2).astype(np.float32)
+            model.replay_buffer.add(obs, next_obs, action, 1.0, False, [{}])
+
+        # Spy on critic forward to check batch sizes
+        original_forward = model.critic.forward
+        call_sizes = []
+        def _spy_forward(obs, actions):
+            call_sizes.append(obs.shape[0])
+            return original_forward(obs, actions)
+        model.critic.forward = _spy_forward
+
+        batch_size = 8
+        model.train(gradient_steps=1, batch_size=batch_size)
+
+        # SAC should NOT have any 2*B or 3*B calls — only B-sized calls
+        assert all(s == batch_size for s in call_sizes), \
+            f"SAC should use separate B-sized calls, got sizes: {call_sizes}"
         vec_env.close()
