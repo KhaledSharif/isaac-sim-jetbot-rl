@@ -420,6 +420,19 @@ class VerboseEpisodeCallback:
                 self._start_time = None
                 self._last_report_step = 0
                 self._report_interval = 100
+                # Enhanced diagnostics
+                self._ep_actions_lin = []   # |linear_vel| per step
+                self._ep_actions_ang = []   # |angular_vel| per step
+                self._ep_goal_dist = None   # goal distance at episode end
+                self._diag_interval = 500   # Q-value probe interval
+                # Rolling stats (last 20 episodes)
+                from collections import deque
+                self._recent_returns = deque(maxlen=20)
+                self._recent_lengths = deque(maxlen=20)
+                self._recent_outcomes = deque(maxlen=20)  # 'S','C','T'
+                self._recent_goal_dists = deque(maxlen=20)
+                self._recent_min_lidars = deque(maxlen=20)
+                self._summary_ep_interval = 20
 
             def _on_training_start(self):
                 import time
@@ -474,6 +487,59 @@ class VerboseEpisodeCallback:
                     )
                     self._last_report_step = total_steps
 
+                # Q-value and buffer diagnostics (every 500 steps)
+                if total_steps % self._diag_interval == 0 and total_steps > 0:
+                    try:
+                        import torch as _th
+                        with _th.no_grad():
+                            obs_t = _th.as_tensor(
+                                self.locals['new_obs'],
+                                dtype=_th.float32,
+                                device=self.model.device,
+                            )
+                            act_pi, log_prob = self.model.actor.action_log_prob(obs_t)
+                            q_vals = self.model.critic(obs_t, act_pi)
+                            if isinstance(q_vals, (list, tuple)):
+                                q_cat = _th.cat(q_vals, dim=1)
+                                q_mean = q_cat.mean().item()
+                                q_min_v = q_cat.min().item()
+                                q_max_v = q_cat.max().item()
+                            else:
+                                q_mean = q_vals.mean().item()
+                                q_min_v = q_vals.min().item()
+                                q_max_v = q_vals.max().item()
+                            entropy = -log_prob.mean().item()
+
+                            # Buffer fill
+                            buf = self.model.replay_buffer
+                            buf_online = buf.size() if hasattr(buf, 'size') else 0
+                            n_demos = getattr(buf, 'n_demos', 0)
+                            buf_cap = getattr(buf, 'buffer_size', 0)
+
+                            # Log to TensorBoard
+                            self.model.logger.record(
+                                "diag/Q_pi_mean", q_mean)
+                            self.model.logger.record(
+                                "diag/Q_pi_min", q_min_v)
+                            self.model.logger.record(
+                                "diag/Q_pi_max", q_max_v)
+                            self.model.logger.record(
+                                "diag/policy_entropy", entropy)
+                            self.model.logger.record(
+                                "diag/buffer_online", buf_online)
+
+                            print(
+                                f"[DIAG]  step={total_steps:>7d} | "
+                                f"Q_pi=[{q_min_v:+.1f}, {q_mean:+.1f}, "
+                                f"{q_max_v:+.1f}] | "
+                                f"H={entropy:+.2f} | "
+                                f"buf={buf_online}/{buf_cap} "
+                                f"demos={n_demos}",
+                                flush=True,
+                            )
+                    except Exception:
+                        pass
+
                 for i in range(len(dones)):
                     info = infos[i] if i < len(infos) else {}
                     reward = float(rewards[i]) if i < len(rewards) else 0.0
@@ -484,6 +550,21 @@ class VerboseEpisodeCallback:
                     min_lid = info.get('min_lidar_distance', float('inf'))
                     if min_lid < self._ep_min_lidar:
                         self._ep_min_lidar = min_lid
+
+                    # Track goal distance and actions for diagnostics
+                    self._ep_goal_dist = info.get(
+                        'goal_distance', self._ep_goal_dist)
+                    actions = self.locals.get('actions')
+                    if actions is not None:
+                        act = np.asarray(
+                            actions[i] if len(actions) > i else actions[0]
+                        ).ravel()
+                        if len(act) >= 2:
+                            self._ep_actions_lin.append(
+                                float(np.mean(np.abs(act[0::2]))))
+                            self._ep_actions_ang.append(
+                                float(np.mean(np.abs(act[1::2]))))
+
 
                     if dones[i]:
                         self._ep_count += 1
@@ -503,21 +584,101 @@ class VerboseEpisodeCallback:
                         sr = self._total_successes / self._ep_count * 100
                         elapsed = time.time() - self._start_time if self._start_time else 0
 
+                        # Goal distance at episode end
+                        gd = self._ep_goal_dist
+                        gd_str = f" | gd={gd:.2f}m" if gd is not None else ""
+
+                        # Action stats for this episode
+                        act_str = ""
+                        if self._ep_actions_lin:
+                            ml = np.mean(self._ep_actions_lin)
+                            ma = np.mean(self._ep_actions_ang)
+                            act_str = f" | act=[{ml:.2f},{ma:.2f}]"
+
                         print(
                             f"[EP {self._ep_count:4d} END]  "
                             f"{outcome:>9s} | "
                             f"steps={self._ep_steps:3d} | "
                             f"return={self._ep_reward:+7.2f} | "
-                            f"min_lidar={self._ep_min_lidar:.3f}m | "
+                            f"min_lidar={self._ep_min_lidar:.3f}m"
+                            f"{gd_str}{act_str} | "
                             f"running SR={sr:.1f}% "
-                            f"({self._total_successes}S/{self._total_collisions}C/{self._total_truncations}T) | "
+                            f"({self._total_successes}S/"
+                            f"{self._total_collisions}C/"
+                            f"{self._total_truncations}T) | "
                             f"t={elapsed:.0f}s",
                             flush=True
                         )
 
+                        # Update rolling stats
+                        self._recent_returns.append(self._ep_reward)
+                        self._recent_lengths.append(self._ep_steps)
+                        self._recent_outcomes.append(outcome[0])
+                        if gd is not None:
+                            self._recent_goal_dists.append(gd)
+                        self._recent_min_lidars.append(self._ep_min_lidar)
+
+                        # TensorBoard per-episode metrics
+                        try:
+                            lg = self.model.logger
+                            lg.record("rollout/ep_return", self._ep_reward)
+                            lg.record("rollout/ep_length", self._ep_steps)
+                            lg.record("rollout/ep_min_lidar",
+                                      self._ep_min_lidar)
+                            if gd is not None:
+                                lg.record("rollout/ep_goal_dist", gd)
+                            n_r = len(self._recent_returns)
+                            if n_r > 0:
+                                lg.record("rollout/return_20ep",
+                                          np.mean(self._recent_returns))
+                                sr_20 = (sum(
+                                    1 for o in self._recent_outcomes
+                                    if o == 'S'
+                                ) / n_r * 100)
+                                lg.record("rollout/sr_20ep", sr_20)
+                        except Exception:
+                            pass
+
+                        # Rolling summary every N episodes
+                        if (self._ep_count % self._summary_ep_interval
+                                == 0):
+                            n = len(self._recent_returns)
+                            if n > 0:
+                                r_m = np.mean(self._recent_returns)
+                                r_s = np.std(self._recent_returns)
+                                l_m = np.mean(self._recent_lengths)
+                                sr20 = (sum(
+                                    1 for o in self._recent_outcomes
+                                    if o == 'S'
+                                ) / n * 100)
+                                cr20 = (sum(
+                                    1 for o in self._recent_outcomes
+                                    if o == 'C'
+                                ) / n * 100)
+                                gd_m = (np.mean(self._recent_goal_dists)
+                                        if self._recent_goal_dists
+                                        else float('nan'))
+                                ml_m = np.mean(self._recent_min_lidars)
+                                print(
+                                    f"[SUMMARY @EP {self._ep_count:4d}] "
+                                    f"last{n}: "
+                                    f"SR={sr20:.0f}% CR={cr20:.0f}% | "
+                                    f"ret={r_m:+.1f}\u00b1{r_s:.1f} | "
+                                    f"len={l_m:.0f} | "
+                                    f"goal_dist={gd_m:.2f}m | "
+                                    f"min_lid={ml_m:.3f}m",
+                                    flush=True,
+                                )
+
+                        # Next episode start info
                         new_obs = self.locals.get('new_obs')
                         if new_obs is not None:
                             obs = new_obs[i] if len(new_obs) > i else new_obs[0]
+                            # For frame-stacked obs, use last frame
+                            if len(obs) > 34 and len(obs) % 34 == 0:
+                                obs = obs[-34:]
+                            elif len(obs) > 36 and len(obs) % 36 == 0:
+                                obs = obs[-36:]
                             # Ego-centric: goal_body_x=[6], goal_body_y=[7], dist=[8]
                             goal_body_x, goal_body_y = obs[6], obs[7]
                             dist = obs[8]
@@ -531,9 +692,13 @@ class VerboseEpisodeCallback:
                                 flush=True
                             )
 
+                        # Reset episode accumulators
                         self._ep_reward = 0.0
                         self._ep_steps = 0
                         self._ep_min_lidar = float('inf')
+                        self._ep_goal_dist = None
+                        self._ep_actions_lin = []
+                        self._ep_actions_ang = []
 
                 return True
 

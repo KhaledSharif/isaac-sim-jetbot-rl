@@ -420,11 +420,13 @@ class JetbotNavigationEnv(gymnasium.Env):
         collision = min_lidar < self.COLLISION_THRESHOLD
 
         # Build info dict
+        goal_distance = float(next_obs[8])
         info = {
             'goal_reached': goal_reached,
             'is_success': goal_reached,
             'collision': collision,
             'min_lidar_distance': min_lidar,
+            'goal_distance': goal_distance,
         }
 
         # Compute constraint cost for SafeTQC

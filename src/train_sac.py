@@ -848,6 +848,9 @@ def _create_safe_tqc_class(tqc_base_cls):
             ent_coef_losses, ent_coefs = [], []
             actor_losses, critic_losses = [], []
             cost_critic_losses, lagrange_values = [], []
+            # Enhanced diagnostics
+            _diag_target_q, _diag_current_q = [], []
+            _diag_batch_reward, _diag_batch_action_mag = [], []
 
             for _ in range(gradient_steps):
                 if is_crossq:
@@ -1005,6 +1008,17 @@ def _create_safe_tqc_class(tqc_base_cls):
 
                 critic_losses.append(critic_loss.item())
 
+                # Accumulate Q-value and batch diagnostics
+                with torch.no_grad():
+                    _diag_target_q.append(target_q.mean().item())
+                    _diag_batch_reward.append(
+                        replay_data.rewards.mean().item())
+                    _diag_batch_action_mag.append(
+                        replay_data.actions.abs().mean().item())
+                    if is_crossq:
+                        _diag_current_q.append(
+                            current_q_values.mean().item())
+
                 self.critic.optimizer.zero_grad()
                 critic_loss.backward()
                 self.critic.optimizer.step()
@@ -1145,6 +1159,19 @@ def _create_safe_tqc_class(tqc_base_cls):
                 self.logger.record("train/cost_critic_loss", np.mean(cost_critic_losses))
             if lagrange_values:
                 self.logger.record("train/lagrange", np.mean(lagrange_values))
+            # Enhanced Q-value and batch diagnostics
+            if _diag_target_q:
+                self.logger.record("train/target_q_mean",
+                                   np.mean(_diag_target_q))
+            if _diag_current_q:
+                self.logger.record("train/current_q_mean",
+                                   np.mean(_diag_current_q))
+            if _diag_batch_reward:
+                self.logger.record("train/batch_reward_mean",
+                                   np.mean(_diag_batch_reward))
+            if _diag_batch_action_mag:
+                self.logger.record("train/batch_action_mag",
+                                   np.mean(_diag_batch_action_mag))
 
         def _get_torch_save_params(self):
             state_dicts, saved_vars = super()._get_torch_save_params()
