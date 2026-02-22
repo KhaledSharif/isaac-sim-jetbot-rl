@@ -200,8 +200,16 @@ def load_demo_transitions(npz_path: str, load_costs: bool = False):
     else:
         demo_obs_version = 1
     if demo_obs_version < OBS_VERSION and observations.shape[1] >= 10:
-        print(f"  Auto-converting demo obs from v{demo_obs_version} to v{OBS_VERSION} (ego-centric)")
-        observations = convert_obs_to_egocentric(observations, DEFAULT_WORKSPACE_BOUNDS)
+        # Use demo's actual arena bounds for conversion, not hardcoded defaults
+        demo_arena = metadata.get('arena_size', None) if isinstance(metadata, dict) else None
+        if demo_arena is not None:
+            half = demo_arena / 2.0
+            ws_bounds = {'x': [-half, half], 'y': [-half, half]}
+            print(f"  Auto-converting demo obs from v{demo_obs_version} to v{OBS_VERSION} (ego-centric, arena={demo_arena}m)")
+        else:
+            ws_bounds = DEFAULT_WORKSPACE_BOUNDS
+            print(f"  Auto-converting demo obs from v{demo_obs_version} to v{OBS_VERSION} (ego-centric, default bounds)")
+        observations = convert_obs_to_egocentric(observations, ws_bounds)
 
     total = len(observations)
     next_obs = np.zeros_like(observations)
