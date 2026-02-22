@@ -1935,6 +1935,37 @@ Examples:
     demo_data = open_demo(args.demos)
     episode_lengths = demo_data['episode_lengths']
 
+    # Recompute demo rewards with current RewardComputer to match RL env
+    # (demos may have been recorded with a different reward function)
+    from jetbot_keyboard_control import RewardComputer
+    _rc = RewardComputer(mode=args.reward_mode,
+                         safe_mode=args.safe and not args.keep_proximity_reward)
+    old_mean = float(demo_rewards_step.mean())
+    _N = len(demo_rewards_step)
+    _lidar_start = demo_obs_step.shape[1] - 24  # dynamic split: last 24 dims are LiDAR
+    # Build next_obs for reward computation (shift within episodes)
+    _next_obs = np.zeros_like(demo_obs_step)
+    _off = 0
+    for _el in episode_lengths:
+        _el = int(_el)
+        _next_obs[_off:_off + _el - 1] = demo_obs_step[_off + 1:_off + _el]
+        _next_obs[_off + _el - 1] = demo_obs_step[_off + _el - 1]
+        _off += _el
+    for _i in range(_N):
+        _obs_i = demo_obs_step[_i]
+        _nobs_i = _next_obs[_i]
+        _min_lidar = float(_nobs_i[_lidar_start:].min()) * 3.0  # denormalize
+        _collision = bool(demo_dones_step[_i]) and _min_lidar < 0.08
+        _goal_reached = bool(_nobs_i[9] > 0.5) if _nobs_i.shape[0] > 9 else False
+        _info = {
+            'collision': _collision,
+            'goal_reached': _goal_reached,
+            'min_lidar_distance': _min_lidar,
+        }
+        demo_rewards_step[_i] = _rc.compute(_obs_i, demo_actions_step[_i], _nobs_i, _info)
+    new_mean = float(demo_rewards_step.mean())
+    print(f"  Recomputed demo rewards: mean {old_mean:.4f} → {new_mean:.4f}")
+
     # Frame-stack demo observations if using temporal processing
     if args.n_frames > 1:
         from demo_utils import build_frame_stacks
