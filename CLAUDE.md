@@ -55,7 +55,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 
 6. **Shared Modules**
    - `jetbot_config.py` - Single source of truth for robot physical constants (`WHEEL_RADIUS`, `WHEEL_BASE`, velocity limits, start pose, workspace bounds), `quaternion_to_yaw()` utility, and `OBS_VERSION` constant
-   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, `build_frame_stacks()`, and `VerboseEpisodeCallback`
+   - `demo_utils.py` - Shared demo data functions: `validate_demo_data()`, `load_demo_data()`, `load_demo_transitions()`, `extract_action_chunks()`, `make_chunk_transitions()`, `build_frame_stacks()`, `convert_obs_to_egocentric()`, and `VerboseEpisodeCallback` (enhanced training diagnostics)
    - `demo_io.py` - Unified demo I/O adapter: `open_demo()` dispatches `.npz`/`.hdf5`, `HDF5DemoWriter` for O(delta) incremental recording, `convert_npz_to_hdf5()` migration utility
 
 ### Key Classes
@@ -74,7 +74,7 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 - **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
 - **FrameStackWrapper**: Gymnasium wrapper stacking last n_frames observations into a single flattened vector; oldest first for natural GRU input order (`src/jetbot_rl_env.py`)
-- **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`)
+- **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`); info dict includes `goal_distance`, `min_lidar_distance`, `collision`, `is_success`, `cost`
 - **ChunkCVAEFeatureExtractor**: SB3 feature extractor with dynamic split: state MLP (state_dim→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D. Split is `obs[:obs_dim-24]` / `obs[obs_dim-24:]` to support 34D and 36D
 - **TemporalCVAEFeatureExtractor**: GRU-based SB3 feature extractor for frame-stacked obs; per-frame state/lidar MLPs → GRU → hidden state + z-pad (`src/train_sac.py`)
 - **pretrain_chunk_cvae()**: CVAE pretraining — encoder maps (obs, action_chunk) → z, decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk; encoder discarded after pretraining
@@ -299,11 +299,12 @@ The RL training pipeline uses SB3's `VecNormalize` to z-score normalize observat
 
 CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via BatchRenorm in critics and no target networks. This eliminates the gradient bottleneck:
 
-| Algorithm | UTD | Steps/s | Time for 1M steps | Speedup |
-|-----------|-----|---------|-------------------|---------|
-| TQC       | 20  | ~2.9    | ~4 days           | 1x      |
-| TQC       | 5   | ~10-12  | ~24 hours         | ~4x     |
-| CrossQ    | 1   | ~35-39  | ~7 hours          | ~13x    |
+| Algorithm | UTD | n-frames | Steps/s | Time for 1M steps | Speedup |
+|-----------|-----|----------|---------|-------------------|---------|
+| TQC       | 20  | 1        | ~2.9    | ~4 days           | 1x      |
+| TQC       | 5   | 1        | ~10-12  | ~24 hours         | ~4x     |
+| CrossQ    | 1   | 1        | ~35-39  | ~7 hours          | ~13x    |
+| CrossQ    | 1   | 4 (GRU)  | ~10     | ~28 hours         | ~3.5x   |
 
 The env step itself (`world.step()`) takes only ~25ms. TQC@UTD=20 adds ~330ms of gradient computation per step.
 
@@ -359,18 +360,35 @@ TemporalCVAEFeatureExtractor (when --n-frames > 1):
 CVAE pretraining (replaces BC warmstart):
   Encoder (train-only): (obs_features, action_chunk) → z
   Decoder (= actor's latent_pi + mu): (obs_features, z) → action_chunk
-  Loss: L1 reconstruction + β·KL
+  Loss: L1 reconstruction + β·KL (free bits floor at 0.25/dim, KL annealing over 40% of epochs)
   After pretraining: encoder discarded, z fixed to 0
 ```
 
+### CVAE KL Collapse (Expected Behavior for Deterministic Demos)
+
+The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos are deterministic (e.g., A* autopilot). This is **correct behavior** — the decoder can reconstruct actions from `obs_features` alone because the A* planner is a deterministic function of the observation. The latent z carries no information by design.
+
+**When collapse is expected:** Deterministic demo sources (A* autopilot, scripted policies). The CVAE effectively becomes a pure BC warmstart with z=0.
+
+**When collapse is a problem:** Multi-modal human demos where different strategies exist for the same state. ACT (Zhao et al., RSS 2023) shows performance drops from 35% to 2% without CVAE on human data.
+
+**Fixes for multi-modal demos (if needed in future):**
+- **Observation dropout** (zero 30-50% of obs_features in decoder during training) — forces z usage
+- **Increase beta** (0.1 → 1.0-10.0; ACT uses beta=10) — counterintuitive but higher beta prevents collapse
+- **Cyclical annealing** (4 cycles instead of monotonic ramp)
+- **Increase z_dim** (8 → 16-32; ACT uses 32)
+
+**Key diagnostic:** Check `active_dims` in CVAE pretraining output. If L1 loss is low and decreasing, pretraining is working correctly regardless of z collapse.
+
 ### Pipeline Order
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
-2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
-3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-k (one nat per chunk step; avoids entropy collapse with tanh squashing)
-4. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
-5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
-6. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
-7. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
+2. Load demo transitions; **recompute demo rewards** with current `RewardComputer` to ensure consistency between demo and online data (avoids stale reward shaping from old reward function)
+3. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
+4. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-k (one nat per chunk step; matches RLPD's `-dim(A)/2` heuristic for correlated chunked actions; avoids entropy collapse with tanh squashing)
+5. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
+6. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
+7. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
+8. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
 
 ### Key Functions & Classes (`src/train_sac.py`)
 - **symlog()**: DreamerV3 symmetric log compression
@@ -414,7 +432,7 @@ CVAE pretraining (replaces BC warmstart):
 
 ### SafeTQC Pipeline Order
 1. Create env with `ChunkedEnvWrapper` + `safe_mode=True` (disables proximity penalty in reward)
-2. Load demo transitions with costs (`load_costs=True`)
+2. Load demo transitions with costs (`load_costs=True`); recompute demo rewards with current RewardComputer
 3. Build chunk-level transitions with costs (`demo_costs=...`)
 4. Create `CostReplayBuffer` with demo chunk costs
 5. Create `SafeTQC` model (cost critic + Lagrange multiplier)
@@ -430,7 +448,96 @@ CVAE pretraining (replaces BC warmstart):
 - `eval_policy.py`: Auto-detects CrossQ/TQC/SAC/PPO, chunk_size, and n_frames from model spaces
 - **CrossQ + SafeTQC**: Joint forward pass concatenates `[obs, next_obs]` (2*B batch) through critic so BatchRenorm sees the mixture distribution; cost critic has its own target network (independent of base algorithm); `_set_bn_mode()` toggles BatchRenorm training mode; actor updates gated by `policy_delay`
 - **CrossQ + DualPolicy**: Joint forward pass concatenates `[obs, next_obs, next_obs]` (3*B batch) for IBRL current/RL/IL Q-values; `_set_bn_mode()` + `policy_delay` gating; polyak update guarded
-- **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric layout on load via `convert_obs_to_egocentric()` in `demo_utils.py`
+- **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric layout on load via `convert_obs_to_egocentric()` in `demo_utils.py`; reads `arena_size` from demo metadata for correct workspace bounds normalization
+
+## Training Diagnostics
+
+The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to both console and TensorBoard.
+
+### Console Output Format
+
+**Every 100 steps:**
+```
+[DEBUG] step=   1000 | elapsed=102.9s | rate=9.7 steps/s | episodes=4 | policy_std=[0.1469] | ent=0.00656
+```
+
+**Every 500 steps (Q-value and buffer probe):**
+```
+[DIAG]  step=   500 | Q_pi=[+8.2, +12.3, +15.1] | H=-6.42 | buf=500/1000000 demos=189394
+```
+- `Q_pi=[min, mean, max]` — critic's value estimate under current policy (watch for overestimation)
+- `H` — policy entropy (should be near target_entropy, not collapsing toward -inf)
+- `buf` — online buffer fill / capacity + demo count
+
+**Every episode end:**
+```
+[EP   30 END]    SUCCESS | steps=299 | return=+180.76 | min_lidar=0.090m | gd=0.45m | act=[0.15,0.42] | running SR=3.3% (1S/15C/14T) | t=865s
+```
+- `gd` — goal distance at episode end (close but timing out? or wandering?)
+- `act=[lin,ang]` — mean |linear_vel|, mean |angular_vel| (is agent moving? spinning in circles?)
+
+**Every 20 episodes (rolling summary):**
+```
+[SUMMARY @EP   20] last20: SR=5% CR=60% | ret=+65.3±40.2 | len=280 | goal_dist=2.10m | min_lid=0.120m
+```
+
+### TensorBoard Metrics
+
+| Metric | Source | What it reveals |
+|--------|--------|----------------|
+| `diag/Q_pi_mean` | Callback | Critic value estimate — overestimation? |
+| `diag/Q_pi_min`, `diag/Q_pi_max` | Callback | Q-value spread |
+| `diag/policy_entropy` | Callback | Exploration level |
+| `diag/buffer_online` | Callback | Online data accumulation |
+| `rollout/ep_return` | Callback | Per-episode return |
+| `rollout/ep_goal_dist` | Callback | Goal distance at episode end |
+| `rollout/ep_min_lidar` | Callback | Closest obstacle approach |
+| `rollout/return_20ep` | Callback | Rolling mean return (last 20 eps) |
+| `rollout/sr_20ep` | Callback | Rolling success rate (last 20 eps) |
+| `train/target_q_mean` | SafeTQC | Mean TD target (what critic learns toward) |
+| `train/current_q_mean` | SafeTQC | Mean current Q estimate |
+| `train/batch_reward_mean` | SafeTQC | Mean reward in sampled batch (demo/online mix) |
+| `train/batch_action_mag` | SafeTQC | Mean |action| in batch |
+
+### What to Look For When Debugging
+
+| Symptom | Likely Cause | Diagnostic to Check |
+|---------|-------------|---------------------|
+| High collision rate (>50%) | Agent ignores LiDAR | `act=[lin,ang]` — high angular = spinning; `min_lidar` pattern |
+| 0% success rate after 50k steps | Goal reward too weak or agent can't navigate | `gd` — if decreasing, agent approaches but fails; if flat, agent wanders |
+| `ent_coef` monotonically decreasing | Entropy death spiral, target_entropy too aggressive | Compare policy entropy `H` vs target_entropy; should stabilize |
+| `ent_coef` monotonically increasing | Policy too deterministic | `policy_std` — if pinned near initial value, CVAE overtightened |
+| Q_pi values growing unboundedly | Critic overestimation | `train/target_q_mean` — should stabilize; if growing > 1000, problem |
+| Returns high but SR=0% | Reward exploitation (distance shaping) | Check if truncated episodes dominate; heading bonus is gated by progress |
+
+## Known Pitfalls & Fixes
+
+### target_entropy for Chunked Actions
+- **Wrong:** `target_entropy="auto"` → SB3 computes `-dim(A)` = `-chunk_size*2` (e.g., -10 for chunk_size=5). This is too aggressive for correlated chunked actions and causes entropy death spiral.
+- **Correct:** `target_entropy=-chunk_size` (e.g., -5 for chunk_size=5). Matches RLPD's `-dim(A)/2` heuristic. One nat per temporal step in the chunk.
+
+### Demo Observation v1→v2 Conversion and Arena Size
+- Old demos (OBS_VERSION=1) are auto-converted to ego-centric layout (v2) on load
+- `convert_obs_to_egocentric()` normalizes positions using workspace bounds: `(x - x_min) / (x_max - x_min)`
+- Must read `arena_size` from demo metadata to get correct bounds. Using wrong bounds (e.g., default 4m when demo was 10m) produces obs[0:2] outside [0,1]
+- **Always match `--arena-size` between demo collection and training**
+
+### Demo Reward Recomputation
+- Demo rewards are recomputed with current `RewardComputer` at load time to ensure consistency with online data
+- Prevents stale reward shaping terms (old heading bonus, old goal reward) from corrupting the critic
+- RLPD assumes reward consistency between demo and online transitions; mismatch causes contradictory gradient signals
+
+### CVAE Beta Selection
+- `--cvae-beta 0.1` (default) works well for deterministic demos
+- `--cvae-beta 10` causes immediate KL collapse (36x KL dominance over reconstruction)
+- For multi-modal demos, higher beta (1.0-10.0) with larger encoder is needed (ACT paper uses beta=10)
+- **Lower beta does NOT prevent collapse** — it makes collapse worse by reducing pressure on encoder
+
+### Post-CVAE Entropy Coefficient
+- CVAE pretraining tightens `log_std` to -2.0 (std~0.135), initial `ent_coef=0.006`
+- With `target_entropy=-chunk_size`, ent_coef should gently increase (0.006→0.01+) as SAC encourages exploration
+- If ent_coef drops monotonically → target_entropy too aggressive (death spiral)
+- Healthy sign: `policy_std` slowly increasing from 0.135 → 0.15-0.20 over first 10k steps
 
 ## Testing
 
