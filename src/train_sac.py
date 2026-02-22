@@ -2064,7 +2064,7 @@ Examples:
             batch_size=args.batch_size,
             gamma=effective_gamma,
             ent_coef=ent_coef,
-            target_entropy="auto",  # -action_dim (e.g. -10 for chunk_size=5)
+            target_entropy=-float(args.chunk_size),  # -k: one nat per sub-action chunk step
             gradient_steps=args.utd_ratio,
             learning_starts=args.learning_starts,
             train_freq=1,

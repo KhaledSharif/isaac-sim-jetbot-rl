@@ -443,16 +443,21 @@ class VerboseEpisodeCallback:
                     elapsed = time.time() - self._start_time if self._start_time else 0
                     rate = total_steps / elapsed if elapsed > 0 else 0
 
-                    # Action stats from last batch
-                    action_str = ""
-                    actions = self.locals.get('actions')
-                    if actions is not None:
-                        act = np.array(actions)
-                        if act.ndim >= 2 and act.shape[-1] >= 2:
-                            action_str = (
-                                f" | act_mean=[{act[...,0].mean():+.3f},{act[...,1].mean():+.3f}]"
-                                f" act_std=[{act[...,0].std():.3f},{act[...,1].std():.3f}]"
-                            )
+                    # Policy log_std (actual exploration noise)
+                    policy_str = ""
+                    try:
+                        import torch as _th
+                        with _th.no_grad():
+                            log_std = self.model.actor.log_std
+                            # log_std may be a Linear layer; get effective bias
+                            if hasattr(log_std, 'bias'):
+                                ls = log_std.bias.data.cpu().numpy()
+                            else:
+                                ls = log_std.data.cpu().numpy()
+                            std_vals = np.exp(ls)
+                            policy_str = f" | policy_std=[{std_vals.mean():.4f}]"
+                    except Exception:
+                        pass
 
                     # Entropy coef
                     ent_str = ""
@@ -464,7 +469,7 @@ class VerboseEpisodeCallback:
                         f"elapsed={elapsed:.1f}s | "
                         f"rate={rate:.1f} steps/s | "
                         f"episodes={self._ep_count}"
-                        f"{action_str}{ent_str}",
+                        f"{policy_str}{ent_str}",
                         flush=True
                     )
                     self._last_report_step = total_steps

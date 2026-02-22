@@ -366,7 +366,7 @@ CVAE pretraining (replaces BC warmstart):
 ### Pipeline Order
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
 2. Build chunk-level demo transitions via `make_chunk_transitions()` → replay buffer
-3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy="auto" (-action_dim)
+3. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-k (one nat per chunk step; avoids entropy collapse with tanh squashing)
 4. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
 5. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
 6. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
