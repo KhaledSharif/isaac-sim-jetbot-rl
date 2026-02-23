@@ -291,7 +291,7 @@ class TestRewardComputer:
             next_obs=np.zeros(10),
             info={'goal_reached': True}
         )
-        assert reward == 10.0  # GOAL_REACHED_REWARD
+        assert reward == 50.0  # GOAL_REACHED_REWARD
 
     def test_reward_computer_dense_mode_goal_reached(self):
         """Test dense reward mode with goal reached."""

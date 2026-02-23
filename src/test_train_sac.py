@@ -1877,7 +1877,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import gymnasium as gym
         from stable_baselines3.common.vec_env import DummyVecEnv
@@ -1904,7 +1904,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import gymnasium as gym
         from stable_baselines3.common.vec_env import DummyVecEnv
@@ -1944,7 +1944,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import gymnasium as gym
         from stable_baselines3.common.vec_env import DummyVecEnv
@@ -1975,7 +1975,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import torch
         import gymnasium as gym
@@ -2046,7 +2046,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import torch
         import gymnasium as gym
@@ -2121,7 +2121,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import torch
         import gymnasium as gym
@@ -2195,7 +2195,7 @@ class TestCrossQCompatibility:
         try:
             from sb3_contrib import CrossQ
         except ImportError:
-            pytest.skip("sb3-contrib CrossQ not available")
+            pytest.fail("sb3-contrib CrossQ not available")
 
         import copy
         import torch
