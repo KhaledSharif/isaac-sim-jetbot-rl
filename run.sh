@@ -7,7 +7,7 @@
 #   ./run.sh replay.py demos/file.npz    # Run replay script
 #   ./run.sh train_bc.py demos/file.npz  # Run training script
 
-ISAAC_PYTHON=~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh
+ISAAC_PYTHON=~/Downloads/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh
 
 # Check if Isaac Sim Python exists
 if [ ! -f "$ISAAC_PYTHON" ]; then

@@ -1,6 +1,6 @@
 # Isaac Sim Jetbot Keyboard Control
 
-Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recording and reinforcement learning training pipeline for NVIDIA Isaac Sim 5.0.0.
+Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recording and reinforcement learning training pipeline for NVIDIA Isaac Sim 5.1.0.
 
 ## Features
 
@@ -23,27 +23,19 @@ Keyboard-controlled Jetbot mobile robot teleoperation with demonstration recordi
 
 ## Requirements
 
-- NVIDIA Isaac Sim 5.0.0 standalone
+- NVIDIA Isaac Sim 5.1.0 standalone
 - NVIDIA RTX GPU
 - Python 3.11 (bundled with Isaac Sim)
 
 ### Python Dependencies
 
 ```bash
-~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 sb3-contrib tensorboard gymnasium
-```
-
-### HDF5 Demo Recording (Recommended)
-
-```bash
-~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install h5py
+~/Downloads/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh -m pip install numpy pynput rich stable-baselines3 sb3-contrib tensorboard gymnasium tqdm h5py lark
 ```
 
 HDF5 enables incremental O(delta) checkpoint saves during recording — checkpoint cost stays ~2ms regardless of dataset size, compared to 200-500ms+ for full NPZ rewrites. Falls back to NPZ automatically if `h5py` is not installed.
 
-### Camera Streaming Dependencies (Optional)
-
-For camera streaming functionality, install GStreamer and PyGObject:
+For camera streaming functionality (optional, Linux only), install GStreamer and PyGObject:
 
 ```bash
 # System packages (Ubuntu/Debian)
@@ -53,7 +45,7 @@ sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
   gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
 
 # Python package (in Isaac Sim environment)
-~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh -m pip install PyGObject
+~/Downloads/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh -m pip install PyGObject
 ```
 
 ## Quick Start

@@ -7,7 +7,7 @@
 #   ./run_tests.sh -k test_name       # Run specific test
 #   ./run_tests.sh --cov              # Run with coverage
 
-ISAAC_PYTHON=~/Downloads/isaac-sim-standalone-5.0.0-linux-x86_64/python.sh
+ISAAC_PYTHON=~/Downloads/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh
 
 # Check if Isaac Sim Python exists
 if [ ! -f "$ISAAC_PYTHON" ]; then

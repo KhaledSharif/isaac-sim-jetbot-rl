@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-**isaac-sim-jetbot-keyboard** is a keyboard-controlled Jetbot mobile robot teleoperation system with demonstration recording and reinforcement learning training pipeline for Isaac Sim 5.0.0.
+**isaac-sim-jetbot-keyboard** is a keyboard-controlled Jetbot mobile robot teleoperation system with demonstration recording and reinforcement learning training pipeline for Isaac Sim 5.1.0.
 
 The Jetbot is a differential-drive mobile robot with two wheels, controlled via keyboard for navigation tasks.
 
@@ -590,7 +590,7 @@ Per-test behaviour can still be customised by overriding the instance's `step` a
 
 ## Dependencies
 
-- Isaac Sim 5.0.0
+- Isaac Sim 5.1.0
 - pynput (keyboard input)
 - rich (terminal UI)
 - numpy
