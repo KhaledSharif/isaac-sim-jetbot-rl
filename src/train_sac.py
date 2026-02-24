@@ -2061,12 +2061,67 @@ Examples:
     _t0 = _time.time()
     if args.resume:
         print(f"Resuming {algo_name} model from {args.resume}...")
-        model = algo_cls.load(
-            args.resume,
-            env=env,
-            device=device_str,
-            tensorboard_log=args.tensorboard_log,
-        )
+        try:
+            model = algo_cls.load(
+                args.resume,
+                env=env,
+                device=device_str,
+                tensorboard_log=args.tensorboard_log,
+            )
+        except (ValueError, KeyError) as load_err:
+            # Optimizer param-group count mismatch — typically when GRU
+            # split-LR (2 groups) was saved but fresh model has 1 group.
+            # Load network weights only; optimizers are recreated below
+            # by _apply_gru_lr().
+            print(f"  Optimizer state incompatible ({type(load_err).__name__}: {load_err})")
+            print(f"  Loading network weights only (optimizers will be recreated)...")
+            from stable_baselines3.common.save_util import (
+                load_from_zip_file, recursive_getattr,
+            )
+            data, params, pytorch_vars = load_from_zip_file(
+                args.resume, device=device_str,
+            )
+            # Reconstruct model from saved hyperparams (mirrors SB3 load())
+            model = algo_cls(
+                policy=data["policy_class"],
+                env=env,
+                device=device_str,
+                tensorboard_log=args.tensorboard_log,
+                _init_setup_model=False,
+            )
+            model.__dict__.update(data)
+            model._setup_model()
+            # Load only network weights, skip optimizer state dicts
+            state_names, var_names = model._get_torch_save_params()
+            loaded_keys, skipped_keys = [], []
+            for name in state_names:
+                if "optimizer" in name:
+                    skipped_keys.append(name)
+                    continue
+                if name in params:
+                    attr = recursive_getattr(model, name)
+                    attr.load_state_dict(params[name])
+                    loaded_keys.append(name)
+                else:
+                    skipped_keys.append(name + " (missing)")
+            print(f"  Loaded state dicts: {loaded_keys}")
+            print(f"  Skipped state dicts: {skipped_keys}")
+            # Load pytorch variables (log_ent_coef, log_lagrange, etc.)
+            # pytorch_vars is a dict {name: tensor}, not a list
+            if pytorch_vars is not None and isinstance(pytorch_vars, dict):
+                for name in var_names:
+                    if name in pytorch_vars:
+                        attr = recursive_getattr(model, name)
+                        attr.data = pytorch_vars[name]
+                        print(f"  Restored variable: {name} = {pytorch_vars[name].item():.6f}")
+                    else:
+                        print(f"  Variable {name} not in checkpoint, using default")
+            elif pytorch_vars is not None:
+                # Fallback for older SB3 list format
+                for name, val in zip(var_names, pytorch_vars):
+                    attr = recursive_getattr(model, name)
+                    attr.data = val
+                    print(f"  Restored variable: {name}")
         # Verify chunk size matches
         loaded_chunk = model.action_space.shape[0] // 2
         if loaded_chunk != args.chunk_size:
@@ -2088,6 +2143,10 @@ Examples:
         model.ent_coef = ent_coef
         # Replace replay buffer with fresh demo buffer (online data is lost)
         model.replay_buffer = replay_buffer
+        # Force initial env.reset() — __dict__.update(data) restores a stale
+        # _last_obs from the checkpoint which makes SB3 skip reset(), leaving
+        # the new env's _prev_obs as None.
+        model._last_obs = None
         # LayerNorm + CVAE weights are already baked into the loaded checkpoint
         # Re-apply separate GRU learning rate (optimizer state is not preserved across resume)
         if args.n_frames > 1:
