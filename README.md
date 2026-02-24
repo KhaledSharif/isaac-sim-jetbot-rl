@@ -383,16 +383,19 @@ Old demos (pre-OBS_VERSION=2) are auto-converted to the new ego-centric format o
 ## Reward Function
 
 ### Dense Mode (default)
-- **Goal reached**: +10.0 (terminal)
-- **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
+- **Goal reached**: +50.0 (terminal)
+- **Collision**: -25.0 (terminal, LiDAR distance < 0.08m)
 - **Distance shaping**: `(prev_dist - curr_dist) * 1.0` — reward for getting closer
-- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1` — reward for facing goal
-- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when near obstacles (auto-removed with `--safe`, handled by cost critic instead)
+- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * progress * 0.5` — only when making forward progress, prevents exploitation from circling near the goal
+- **Approach bonus**: Potential-based shaping within 1m of goal — `10.0 * (max(0, 1 - curr_dist/1.0) - max(0, 1 - prev_dist/1.0))`. Amplifies distance shaping 10x near the goal. Provably unexploitable (Ng et al., 1999): orbiting gives 0, oscillating cancels out
+- **Proximity penalty**: `0.05 * (1.0 - min_lidar / 0.3)` when near obstacles, gated by goal distance (auto-removed with `--safe`, handled by cost critic instead)
 - **Time penalty**: -0.005 per step
 
+**Reward hierarchy:** collision (-25) >> max proximity accumulation (~-10) >> time penalty (-10 over 400 steps). This ensures collisions are always worse than proximity accumulation or bad truncations.
+
 ### Sparse Mode
-- **Goal reached**: +10.0
-- **Collision**: -10.0
+- **Goal reached**: +50.0
+- **Collision**: -25.0
 - **Otherwise**: 0.0
 
 ## TensorBoard

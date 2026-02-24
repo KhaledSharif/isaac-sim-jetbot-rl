@@ -809,8 +809,10 @@ class TestDemoRecorder:
         reward_collision = rc.compute(obs, np.zeros(2), next_obs, info_collision)
         reward_normal = rc.compute(obs, np.zeros(2), next_obs, info_no_collision)
 
-        assert reward_collision == -10.0, f"Collision should give -10.0, got {reward_collision}"
-        assert reward_normal != -10.0, "Normal step should not give -10.0"
+        assert reward_collision == RewardComputer.COLLISION_PENALTY, \
+            f"Collision should give {RewardComputer.COLLISION_PENALTY}, got {reward_collision}"
+        assert reward_normal != RewardComputer.COLLISION_PENALTY, \
+            f"Normal step should not give {RewardComputer.COLLISION_PENALTY}"
 
     def test_reward_includes_proximity_penalty(self):
         """RewardComputer should apply proximity penalty when min_lidar_distance is small."""
@@ -831,6 +833,53 @@ class TestDemoRecorder:
         reward_far = rc.compute(obs, np.zeros(2), next_obs, info_far)
 
         assert reward_close < reward_far, "Close to obstacle should have worse reward"
+
+    def test_approach_bonus_within_radius(self):
+        """Approach bonus should give higher reward when moving toward goal within radius."""
+        from jetbot_keyboard_control import RewardComputer
+        rc = RewardComputer(mode='dense')
+        info = {'goal_reached': False, 'collision': False, 'min_lidar_distance': 1.0}
+
+        # Robot approaching goal: gd shrinks from 0.8m to 0.5m (within 1m radius)
+        obs_approach = np.zeros(34)
+        obs_approach[8] = 0.8
+        next_obs_approach = np.zeros(34)
+        next_obs_approach[8] = 0.5
+        reward_approach = rc.compute(obs_approach, np.zeros(2), next_obs_approach, info)
+
+        # Robot moving away: gd grows from 0.5m to 0.8m (within 1m radius)
+        obs_away = np.zeros(34)
+        obs_away[8] = 0.5
+        next_obs_away = np.zeros(34)
+        next_obs_away[8] = 0.8
+        reward_away = rc.compute(obs_away, np.zeros(2), next_obs_away, info)
+
+        assert reward_approach > reward_away, \
+            "Approaching goal within radius should give higher reward than moving away"
+
+    def test_approach_bonus_zero_outside_radius(self):
+        """Approach bonus should be zero when both positions are outside radius."""
+        from jetbot_keyboard_control import RewardComputer
+        rc = RewardComputer(mode='dense')
+        info = {'goal_reached': False, 'collision': False, 'min_lidar_distance': 1.0}
+
+        # Robot at gd=2.0m moving to gd=1.5m (both outside 1m radius)
+        obs_a = np.zeros(34)
+        obs_a[8] = 2.0
+        next_obs_a = np.zeros(34)
+        next_obs_a[8] = 1.5
+        reward_a = rc.compute(obs_a, np.zeros(2), next_obs_a, info)
+
+        # Robot at gd=3.0m moving to gd=2.5m (both outside 1m radius)
+        obs_b = np.zeros(34)
+        obs_b[8] = 3.0
+        next_obs_b = np.zeros(34)
+        next_obs_b[8] = 2.5
+        reward_b = rc.compute(obs_b, np.zeros(2), next_obs_b, info)
+
+        # Same distance progress (0.5m), both outside radius — equal reward
+        assert abs(reward_a - reward_b) < 1e-6, \
+            f"Both outside radius should get equal reward, got {reward_a} vs {reward_b}"
 
     def test_done_flag_false_on_timeout(self):
         """Done should NOT be True for timeout — timeout is truncation, not termination."""

@@ -509,6 +509,8 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | `ent_coef` monotonically increasing | Policy too deterministic | `policy_std` — if pinned near initial value, CVAE overtightened |
 | Q_pi values growing unboundedly | Critic overestimation | `train/target_q_mean` — should stabilize; if growing > 1000, problem |
 | Returns high but SR=0% | Reward exploitation (distance shaping) | Check if truncated episodes dominate; heading bonus is gated by progress |
+| Near-miss episodes (gd<0.5m) still negative returns | Approach bonus too weak or radius too small | Check `APPROACH_BONUS_SCALE` and `APPROACH_BONUS_RADIUS`; near-misses at gd=0.25m should get ~+7.5 approach bonus |
+| Proximity penalty > collision penalty | `PROXIMITY_SCALE` too high or `COLLISION_PENALTY` too low | Per-episode proximity should stay below collision magnitude; check hierarchy: collision >> proximity >> time |
 
 ## Known Pitfalls & Fixes
 
@@ -532,6 +534,14 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 - `--cvae-beta 10` causes immediate KL collapse (36x KL dominance over reconstruction)
 - For multi-modal demos, higher beta (1.0-10.0) with larger encoder is needed (ACT paper uses beta=10)
 - **Lower beta does NOT prevent collapse** — it makes collapse worse by reducing pressure on encoder
+
+### Reward Hierarchy Design
+The reward constants are tuned to maintain a clear penalty hierarchy:
+- **Collision (-25)** >> **max proximity accumulation (~-10/episode)** >> **time penalty (-10 over 2000 sub-steps)**
+- Without this hierarchy, proximity penalty can accumulate to -20+/episode — worse than collision (-10), making the agent prefer crashing over cautious navigation
+- The **approach bonus** (potential-based, SCALE=10.0, RADIUS=1.0m) smooths the "success cliff": without it, an agent at gd=0.26m gets -6.65 while gd=0.15m gets +49 — a 55-point cliff that's hard for the critic to model. With it, gd=0.26m gets ~+1, gd=0.15m gets ~+57 — much smoother gradient
+- Potential-based shaping (Ng et al., 1999) is provably unexploitable: orbiting at fixed distance gives 0, oscillating in/out cancels. Only net approach toward goal yields reward
+- **Heading bonus (0.5)** is gated by forward progress (`prev_dist > curr_dist`), so it's proportional to `progress * alignment` — can't be exploited by slow creeping or circling
 
 ### Post-CVAE Entropy Coefficient
 - CVAE pretraining tightens `log_std` to -2.0 (std~0.135), initial `ent_coef=0.006`
@@ -577,15 +587,16 @@ Per-test behaviour can still be customised by overriding the instance's `step` a
 
 ### Dense Mode (default)
 - **Goal reached**: +50.0 (terminal)
-- **Collision**: -10.0 (terminal, LiDAR distance < 0.08m)
+- **Collision**: -25.0 (terminal, LiDAR distance < 0.08m)
 - **Distance shaping**: `(prev_dist - curr_dist) * 1.0`
-- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.1` — **only when making forward progress** (`prev_dist > curr_dist`), prevents reward exploitation from circling near the goal
-- **Proximity penalty**: `0.1 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m, gated by goal distance (linearly reduced within 0.5m of goal, zero at goal). Auto-removed when `--safe` is active (handled by cost critic); `--keep-proximity-reward` to override
+- **Heading bonus**: `((pi - |angle_to_goal|) / pi) * 0.5` — **only when making forward progress** (`prev_dist > curr_dist`), prevents reward exploitation from circling near the goal
+- **Approach bonus**: Potential-based shaping within 1m of goal — `10.0 * (max(0, 1 - curr_dist/1.0) - max(0, 1 - prev_dist/1.0))`. Amplifies distance shaping 10x near the goal. Provably unexploitable: orbiting gives 0, oscillating cancels out (Ng et al., 1999)
+- **Proximity penalty**: `0.05 * (1.0 - min_lidar / 0.3)` when min_lidar < 0.3m, gated by goal distance (linearly reduced within 0.5m of goal, zero at goal). Auto-removed when `--safe` is active (handled by cost critic); `--keep-proximity-reward` to override
 - **Time penalty**: -0.005 per step
 
 ### Sparse Mode
 - **Goal reached**: +50.0
-- **Collision**: -10.0
+- **Collision**: -25.0
 - **Otherwise**: 0.0
 
 ## Dependencies

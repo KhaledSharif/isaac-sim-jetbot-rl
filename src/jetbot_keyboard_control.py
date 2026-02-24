@@ -1147,13 +1147,15 @@ class RewardComputer:
     # Reward constants
     GOAL_REACHED_REWARD = 50.0
     DISTANCE_SCALE = 1.0
-    HEADING_BONUS_SCALE = 0.1
-    COLLISION_PENALTY = -10.0
-    PROXIMITY_SCALE = 0.1
+    HEADING_BONUS_SCALE = 0.5
+    COLLISION_PENALTY = -25.0
+    PROXIMITY_SCALE = 0.05
     PROXIMITY_THRESHOLD = 0.3  # meters
     PROXIMITY_GATE_DIST = 0.5  # meters — full penalty beyond this distance
     TIME_PENALTY = -0.005
     ROBOT_RADIUS = 0.08  # Jetbot effective radius
+    APPROACH_BONUS_SCALE = 10.0
+    APPROACH_BONUS_RADIUS = 1.0  # meters
 
     def __init__(self, mode: str = 'dense', safe_mode: bool = False):
         """Initialize the RewardComputer.
@@ -1217,6 +1219,12 @@ class RewardComputer:
             angle_to_goal = abs(np.arctan2(next_obs[7], next_obs[6]))
             heading_bonus = (np.pi - angle_to_goal) / np.pi  # 1.0 when facing goal
             reward += heading_bonus * progress * self.HEADING_BONUS_SCALE
+
+        # Goal approach bonus (potential-based — unexploitable)
+        # Amplifies distance shaping 10x within 1m of goal
+        prev_approach = self.APPROACH_BONUS_SCALE * max(0.0, 1.0 - prev_dist / self.APPROACH_BONUS_RADIUS)
+        curr_approach = self.APPROACH_BONUS_SCALE * max(0.0, 1.0 - curr_dist / self.APPROACH_BONUS_RADIUS)
+        reward += curr_approach - prev_approach
 
         # Proximity penalty (smooth, increases as robot nears obstacle)
         # Gated by goal distance: full penalty far from goal, zero at goal
