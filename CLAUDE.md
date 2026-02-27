@@ -60,36 +60,18 @@ The Jetbot is a differential-drive mobile robot with two wheels, controlled via 
 
 ### Key Classes
 
-- **TUIRenderer**: Rich-based terminal UI for robot state display
-- **SceneManager**: Manages goal markers and scene objects
-- **DemoRecorder**: Records (obs, action, reward, done, cost) tuples; uses HDF5 incremental writes by default (O(delta) checkpoints), falls back to NPZ
-- **DemoPlayer**: Loads and replays recorded demonstrations (supports both `.npz` and `.hdf5`)
-- **open_demo()**: Unified reader dispatching on file extension — returns dict-like `NpzDemoData` or `Hdf5DemoData` (`src/demo_io.py`)
-- **HDF5DemoWriter**: Incremental HDF5 writer with resizable chunked datasets, O(delta) `append_steps()`/`flush()` (`src/demo_io.py`)
-- **ActionMapper**: Maps keyboard keys to velocity commands
-- **ObservationBuilder**: Builds observation vectors from robot state
-- **RewardComputer**: Computes navigation rewards; `compute_cost()` static method for SafeTQC cost signal; `safe_mode` suppresses proximity penalty
-- **CameraStreamer**: GStreamer H264 RTP UDP camera streaming (`src/camera_streamer.py`)
+- **DemoRecorder**: Records (obs, action, reward, done, cost) tuples; HDF5 incremental writes by default, falls back to NPZ
+- **open_demo()**: Unified reader dispatching `.npz`/`.hdf5` — returns dict-like `NpzDemoData` or `Hdf5DemoData` (`src/demo_io.py`)
+- **HDF5DemoWriter**: Incremental HDF5 writer with O(delta) `append_steps()`/`flush()` (`src/demo_io.py`)
+- **RewardComputer**: Computes navigation rewards; `compute_cost()` for SafeTQC; `safe_mode` suppresses proximity penalty
 - **LidarSensor**: Analytical 2D raycasting for obstacle detection (no physics dependency)
-- **OccupancyGrid**: 2D boolean grid from obstacle geometry, inflated by robot radius for C-space planning
 - **AutoPilot**: A*-based expert controller with privileged scene access for collision-free demo collection
-- **FrameStackWrapper**: Gymnasium wrapper stacking last n_frames observations into a single flattened vector; oldest first for natural GRU input order (`src/jetbot_rl_env.py`)
-- **ChunkedEnvWrapper**: Gymnasium wrapper converting single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`); info dict includes `goal_distance`, `min_lidar_distance`, `collision`, `is_success`, `cost`
-- **ChunkCVAEFeatureExtractor**: SB3 feature extractor with dynamic split: state MLP (state_dim→32D) + LiDAR MLP (24→64D) + z-pad (8D) = 104D. Split is `obs[:obs_dim-24]` / `obs[obs_dim-24:]` to support 34D and 36D
-- **TemporalCVAEFeatureExtractor**: GRU-based SB3 feature extractor for frame-stacked obs; per-frame state/lidar MLPs → GRU → hidden state + z-pad (`src/train_sac.py`)
-- **pretrain_chunk_cvae()**: CVAE pretraining — encoder maps (obs, action_chunk) → z, decoder (= actor's latent_pi + mu) maps (obs_features || z) → action_chunk; encoder discarded after pretraining
-- **SafeTQC**: CrossQ/TQC subclass with dual cost critic + Lagrange multiplier for constrained RL (`src/train_sac.py`)
-- **CostReplayBuffer**: Parallel ring buffer storing per-transition costs alongside the main replay buffer (`src/train_sac.py`)
-- **MeanCostCritic**: Twin-Q mean-value cost critic with independent feature extractor (`src/train_sac.py`)
-- **SafeTrainingCallback**: SB3 callback tracking per-transition and per-episode costs, logging to TensorBoard (`src/train_sac.py`)
-
-### Training Pipeline Functions (`src/train_rl.py`)
-
-- **prewarm_vecnormalize()**: Seeds VecNormalize's `obs_rms` and `ret_rms` running statistics from demo data so BC/critic pretraining operates on the same normalized scale as PPO
-- **normalize_obs()**: Applies `(obs - mean) / std` clipped to `[-clip_obs, clip_obs]`, matching VecNormalize's transform
-- **normalize_returns()**: Applies `returns / std` clipped to `[-clip_reward, clip_reward]`, matching VecNormalize's reward normalization (no mean subtraction)
-- **bc_warmstart()**: Pretrains PPO actor on normalized demo observations via MSE loss
-- **pretrain_critic()**: Pretrains PPO critic on normalized observations and scaled MC returns
+- **FrameStackWrapper**: Stacks last n_frames observations into (n_frames * obs_dim,), oldest first (`src/jetbot_rl_env.py`)
+- **ChunkedEnvWrapper**: Converts single-step env to k-step chunked env for Q-chunking (`src/jetbot_rl_env.py`); info dict includes `goal_distance`, `min_lidar_distance`, `collision`, `is_success`, `cost`
+- **ChunkCVAEFeatureExtractor**: Dynamic split: state MLP (state_dim->32D) + LiDAR MLP (24->64D) + z-pad (8D) = 104D. Split is `obs[:obs_dim-24]` / `obs[obs_dim-24:]` for 34D/36D
+- **TemporalCVAEFeatureExtractor**: GRU-based feature extractor for frame-stacked obs (`src/train_sac.py`)
+- **SafeTQC**: CrossQ/TQC subclass with dual cost critic + Lagrange multiplier (`src/train_sac.py`)
+- **CostReplayBuffer**: Parallel ring buffer storing per-transition costs (`src/train_sac.py`)
 
 ## Keyboard Controls
 
@@ -148,83 +130,33 @@ The keyboard controller uses 10D by default; pass `--use-lidar` for 34D.
 ## Running the Project
 
 ```bash
-# Teleoperation (camera streaming enabled by default)
-./run.sh
+# Teleoperation
+./run.sh                                      # camera streaming on by default
+./run.sh --no-camera                          # disable camera
+./run.sh --enable-recording                   # manual recording
 
-# Disable camera streaming
-./run.sh --no-camera
-
-# Custom camera port
-./run.sh --camera-port 5601
-
-# With recording enabled
-./run.sh --enable-recording
-
-# Automatic demo collection (100 episodes)
-./run.sh --enable-recording --automatic
-
-# Custom episode count
+# Automatic demo collection (--automatic forces --use-lidar)
 ./run.sh --enable-recording --automatic --num-episodes 200
+./run.sh --enable-recording --automatic --continuous --headless-tui
 
-# Continuous mode (run until Esc)
-./run.sh --enable-recording --automatic --continuous
-
-# Headless TUI (console progress prints)
-./run.sh --enable-recording --automatic --num-episodes 200 --headless-tui
-
-# Collect 34D demos with LiDAR observations
-# Note: --automatic now forces --use-lidar automatically
-./run.sh --enable-recording --automatic --use-lidar
-
-# PPO Training (from scratch)
+# PPO Training
 ./run.sh train_rl.py --headless --timesteps 500000
-
-# PPO Training with BC warmstart
 ./run.sh train_rl.py --headless --bc-warmstart demos/recording.npz --timesteps 1000000
 
 # CrossQ + Chunk CVAE + Q-Chunking (recommended, ~35-39 steps/s)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --timesteps 500000
 
-# Legacy TQC (slower but proven, ~2.9 steps/s at UTD=20)
+# Legacy TQC (~2.9 steps/s at UTD=20)
 ./run.sh train_sac.py --demos demos/recording.npz --headless --legacy-tqc --utd-ratio 20
 
-# Custom chunk size and UTD ratio
-./run.sh train_sac.py --demos demos/recording.npz --headless --chunk-size 5 --utd-ratio 5
-
-# CrossQ with custom demo ratio (75% demo, 25% online)
-./run.sh train_sac.py --demos demos/recording.npz --headless --demo-ratio 0.75
-
-# Custom CVAE hyperparameters
-./run.sh train_sac.py --demos demos/recording.npz --headless \
-  --cvae-epochs 200 --cvae-beta 0.05 --cvae-z-dim 16
-
-# GRU recurrent policy via frame stacking
-./run.sh train_sac.py --demos demos/recording.npz --headless --n-frames 4 --gru-hidden 128
-
 # Resume training from checkpoint
-./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/crossq_jetbot_50000_steps.zip --timesteps 500000
-
-# Include previous action in observations (36D instead of 34D)
-./run.sh train_sac.py --demos demos/recording.npz --headless --add-prev-action
+./run.sh train_sac.py --demos demos/recording.npz --headless --resume models/checkpoints/crossq_jetbot_50000_steps.zip
 
 # SafeTQC: constrained RL with cost critic + Lagrange multiplier
 ./run.sh train_sac.py --demos demos/recording.npz --headless --safe
 
-# SafeTQC with custom cost limit and cost type
-./run.sh train_sac.py --demos demos/recording.npz --headless --safe --cost-limit 10.0 --cost-type both
-
-# SafeTQC keeping proximity penalty in reward (default: auto-removed)
-./run.sh train_sac.py --demos demos/recording.npz --headless --safe --keep-proximity-reward
-
-# Evaluation (auto-detects CrossQ/TQC/SAC/PPO and chunk size)
+# Evaluation (auto-detects algorithm and chunk size)
 ./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100
-./run.sh eval_policy.py models/ppo_jetbot.zip --episodes 100
-
-# Evaluation with cost tracking
-./run.sh eval_policy.py models/crossq_jetbot.zip --episodes 100 --safe --cost-type proximity
-
-# Evaluation with explicit chunk size or inflation radius
-./run.sh eval_policy.py models/crossq_jetbot.zip --chunk-size 5 --inflation-radius 0.08
 
 # Tests
 ./run_tests.sh
@@ -297,7 +229,7 @@ The RL training pipeline uses SB3's `VecNormalize` to z-score normalize observat
 
 ### CrossQ@UTD=1 vs TQC@UTD=20
 
-CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via BatchRenorm in critics and no target networks. This eliminates the gradient bottleneck:
+CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via BatchRenorm in critics and no target networks:
 
 | Algorithm | UTD | n-frames | Steps/s | 1M Steps Wall Time | Speedup |
 |-----------|-----|----------|---------|-------------------|---------|
@@ -306,19 +238,9 @@ CrossQ (default) achieves equal sample efficiency to TQC@UTD=20 at **UTD=1** via
 | CrossQ    | 1   | 1        | ~35-39  | ~7 hours          | ~13x    |
 | CrossQ    | 1   | 4 (GRU)  | ~17     | ~16 hours         | ~6x     |
 
-**Measured step-time breakdown (chunk_size=5, headless, RTX 3090 Ti):**
-- `world.step()` alone: **~1.3ms** per physics tick
-- Full inner `env.step()` (physics + obs build + reward): **~3.0ms**
-- `ChunkedEnvWrapper` total (5 sub-steps, Python overhead): **~15ms** (5 × 3.0ms, overhead≈0)
-- CrossQ gradient step (GRU n-frames=4): **~23ms** measured (total=23.3ms from `_create_timed_cls` instrumentation)
-- CrossQ gradient step (n-frames=1): **~1ms** (physics dominates at ~15–26ms per chunk)
-- SB3 framework overhead (collection loop, callbacks, TensorBoard, numpy): **~13ms** per step — explains gap between 37ms (physics+grad) and observed ~50ms (20 steps/s)
+Step-time breakdown (chunk_size=5, headless, RTX 3090 Ti): `world.step()` ~1.3ms, `env.step()` ~3.0ms, `ChunkedEnvWrapper` ~15ms (5 sub-steps), CrossQ gradient ~1ms (n-frames=1) or ~23ms (GRU). SB3 framework overhead ~13ms/step. Note: `rate=` in `[DEBUG]` lines is cumulative average, not instantaneous — use SB3's `fps` metric.
 
-The `rate=` field in `[DEBUG]` lines is a **cumulative average** (total_steps / total_elapsed), not instantaneous throughput. SB3's `fps` metric is the correct instantaneous rate. The cumulative average is inflated by fast startup phases (CVAE pretraining, demo loading).
-
-TQC@UTD=20 adds ~330ms of gradient computation per wrapper step (20 × ~16ms per gradient step).
-
-**Recommendation:** Use CrossQ (default) for ~13x speedup. Use `--legacy-tqc --utd-ratio 20` only if you need exact TQC reproduction.
+**Recommendation:** Use CrossQ (default). Use `--legacy-tqc --utd-ratio 20` only for exact TQC reproduction.
 
 ### Obstacle Types: Visual vs Fixed
 
@@ -334,12 +256,6 @@ In headless mode, `jetbot_rl_env.py` applies several optimizations:
 - Reduced solver iterations and CPU broadphase (MBP) via `_optimize_physics_scene()`
 
 These collectively save a few ms per step but are minor compared to UTD ratio.
-
-### What Does NOT Help Much
-
-- **`disable_viewport_updates`**: Small effect since `--no-window` already suppresses most rendering
-- **CPU vs GPU physics**: Marginal for single-robot scenes — PhysX auto-selects well
-- **Reducing reset settle steps**: Saves 8 steps per episode (~200ms/reset), negligible over 1M steps
 
 ## Chunk CVAE + Q-Chunking
 
@@ -374,21 +290,9 @@ CVAE pretraining (replaces BC warmstart):
   After pretraining: encoder discarded, z fixed to 0
 ```
 
-### CVAE KL Collapse (Expected Behavior for Deterministic Demos)
+### CVAE KL Collapse
 
-The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos are deterministic (e.g., A* autopilot). This is **correct behavior** — the decoder can reconstruct actions from `obs_features` alone because the A* planner is a deterministic function of the observation. The latent z carries no information by design.
-
-**When collapse is expected:** Deterministic demo sources (A* autopilot, scripted policies). The CVAE effectively becomes a pure BC warmstart with z=0.
-
-**When collapse is a problem:** Multi-modal human demos where different strategies exist for the same state. ACT (Zhao et al., RSS 2023) shows performance drops from 35% to 2% without CVAE on human data.
-
-**Fixes for multi-modal demos (if needed in future):**
-- **Observation dropout** (zero 30-50% of obs_features in decoder during training) — forces z usage
-- **Increase beta** (0.1 → 1.0-10.0; ACT uses beta=10) — counterintuitive but higher beta prevents collapse
-- **Cyclical annealing** (4 cycles instead of monotonic ramp)
-- **Increase z_dim** (8 → 16-32; ACT uses 32)
-
-**Key diagnostic:** Check `active_dims` in CVAE pretraining output. If L1 loss is low and decreasing, pretraining is working correctly regardless of z collapse.
+KL collapse (`active_dims=0`) is **expected** for deterministic demos (A* autopilot) — the decoder reconstructs from `obs_features` alone. Check `active_dims` in CVAE output; if L1 loss is low and decreasing, pretraining is correct regardless of z collapse. `--cvae-beta 0.1` works for deterministic demos; `--cvae-beta 10` causes immediate collapse.
 
 ### Pipeline Order
 1. Create env with `ChunkedEnvWrapper(env, chunk_size=k, gamma=γ)`
@@ -401,75 +305,46 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 8. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
 9. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
 
-### Key Functions & Classes (`src/train_sac.py`)
-- **symlog()**: DreamerV3 symmetric log compression
-- **_set_bn_mode()**: Toggle BatchRenorm training mode if supported (CrossQ only; no-op for TQC/SAC)
-- **_create_timed_cls()**: Wraps any SB3 algo class with a `train()` override that measures total gradient step wall time and enforces the `--ent-coef-min` floor for plain CrossQ/SAC (SafeTQC/DualPolicy have their own floor in their `train()` overrides); applied unconditionally before `--safe`/`--dual-policy` wrapping
-- **_patch_actor_for_stability()**: Monkey-patches `actor.get_action_dist_params()` to clamp pre-tanh means (`--mean-clamp`), floor log_std (`--log-std-min`), and store `_last_mean_actions` for diagnostics/regularization. Guards against double-patching via `_stability_patched` flag.
-- **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
-- **TemporalCVAEFeatureExtractor.get_class()**: Returns GRU-based SB3 feature extractor for frame-stacked observations
-- **pretrain_chunk_cvae()**: CVAE pretraining on demo action chunks; trains feature extractor + actor layers
-
-### Key Functions (`src/demo_utils.py`)
-- **extract_action_chunks()**: Sliding-window action chunks within episode boundaries
-- **make_chunk_transitions()**: Chunk-level (obs, action, R_chunk, next_obs, done) transitions
-- **build_frame_stacks()**: Converts step-level obs (N, 34) → (N, n_frames * 34), respecting episode boundaries
-
-### Key Classes (`src/jetbot_rl_env.py`)
-- **FrameStackWrapper**: Gymnasium wrapper stacking last n_frames observations into (n_frames * obs_dim,), oldest first
-- **ChunkedEnvWrapper**: Gymnasium wrapper expanding action space to (k*2,), executing k sub-steps
-
 ### CLI Flags
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--legacy-tqc` | off | Use TQC instead of CrossQ (legacy mode) |
-| `--utd-ratio` | 1 | Update-to-data ratio (CrossQ=1, legacy TQC=20) |
-| `--policy-delay` | 1 | Actor update delay (CrossQ paper uses 20 with UTD=20) |
-| `--add-prev-action` | off | Include previous action in observations (36D instead of 34D) |
+| `--legacy-tqc` | off | Use TQC instead of CrossQ |
+| `--utd-ratio` | 1 | Update-to-data ratio (CrossQ=1, TQC=20) |
+| `--policy-delay` | 1 | Actor update delay |
+| `--add-prev-action` | off | 36D obs (adds prev action) |
 | `--chunk-size` | 10 | Action chunk size (k) |
-| `--n-frames` | 1 | Number of observations to stack (1 = no stacking) |
-| `--gru-hidden` | 128 | GRU hidden dimension (only used when n-frames > 1) |
-| `--gru-lr` | 1e-5 | GRU learning rate (only used when n-frames > 1) |
+| `--n-frames` | 1 | Obs stack depth (1=no stacking) |
+| `--gru-hidden` | 128 | GRU hidden dim (n-frames>1 only) |
+| `--gru-lr` | 1e-5 | GRU learning rate (n-frames>1 only) |
 | `--cvae-z-dim` | 8 | CVAE latent dimension |
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
-| `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
-| `--log-std-init` | -2.0 | Actor log_std after CVAE or on `--resume`. -2.0 = keep CVAE/checkpoint value (new stability fixes handle entropy). Pass -0.5 for old behavior of boosting exploration noise. |
-| `--ent-coef-init` | 0.1 | ent_coef to set after CVAE pretraining or on resume. CVAE/checkpoint may leave ent_coef near 0.006 giving negligible entropy bonus vs Q-values. Applied on both fresh start and `--resume`; pass 0 to disable. |
-| `--mean-clamp` | 3.0 | Clamp \|pre-tanh mean\| (0=disable). Prevents tanh saturation (tanh(3)=0.995). |
-| `--mean-reg` | 0.001 | L2 reg weight on pre-tanh means (0=disable). Penalizes large means. |
-| `--log-std-min` | -5.0 | Minimum log_std floor (SB3 default: -20). exp(-5)=0.007 prevents near-zero std. |
-| `--ent-coef-min` | 0.005 | Floor for ent_coef (0=disable). Prevents entropy death spiral. Applied to both plain CrossQ and SafeTQC/DualPolicy. |
-| `--target-entropy` | None (-chunk_size) | Target entropy for SAC auto-tuner. Default -chunk_size is unreachable for tanh-squashed chunked actions (actual H~+10 nats); use 0 or +5 for reachable equilibrium. |
-| `--no-backup-entropy` | off | Remove entropy from TD target (RLPD-style). Reduces entropy-driven Q instability. |
-| `--safe` | off | Enable SafeTQC (cost critic + Lagrange) |
+| `--cvae-lr` | 1e-3 | CVAE learning rate |
+| `--log-std-init` | -2.0 | Actor log_std after CVAE/resume (-2.0=keep, -0.5=boost exploration) |
+| `--ent-coef-init` | 0.1 | ent_coef after CVAE/resume (0=disable reset) |
+| `--mean-clamp` | 3.0 | Clamp \|pre-tanh mean\| (0=disable) |
+| `--mean-reg` | 0.001 | L2 reg on pre-tanh means (0=disable) |
+| `--log-std-min` | -5.0 | log_std floor (SB3 default: -20) |
+| `--ent-coef-min` | 0.005 | ent_coef floor (0=disable) |
+| `--target-entropy` | -chunk_size | SAC target entropy; use 0 or +5 for reachable equilibrium |
+| `--no-backup-entropy` | off | Remove entropy from TD target |
+| `--safe` | off | SafeTQC (cost critic + Lagrange) |
 | `--cost-limit` | 25.0 | Per-episode cost budget |
-| `--lagrange-lr` | 3e-4 | Lagrange multiplier learning rate |
+| `--lagrange-lr` | 3e-4 | Lagrange multiplier LR |
 | `--lagrange-init` | 0.0 | Initial log-lambda |
-| `--cost-n-critics` | 2 | Number of cost critic networks |
-| `--cost-critic-type` | mean | `mean` (MSE) or `quantile` |
+| `--cost-n-critics` | 2 | Cost critic count |
+| `--cost-critic-type` | mean | `mean` or `quantile` |
 | `--cost-type` | proximity | `proximity`, `collision`, or `both` |
 | `--keep-proximity-reward` | off | Keep proximity penalty with `--safe` |
 
-### SafeTQC Pipeline Order
-1. Create env with `ChunkedEnvWrapper` + `safe_mode=True` (disables proximity penalty in reward)
-2. Load demo transitions with costs (`load_costs=True`); recompute demo rewards with current RewardComputer
-3. Build chunk-level transitions with costs (`demo_costs=...`)
-4. Create `CostReplayBuffer` with demo chunk costs
-5. Create `SafeTQC` model (cost critic + Lagrange multiplier)
-6. Inject LayerNorm into reward critics and cost critics
-7. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks
-8. Copy pretrained feature extractor weights → reward critic + cost critic
-9. Train with `SafeTrainingCallback` tracking per-step costs
+### SafeTQC Pipeline
+
+Same as above but: env uses `safe_mode=True` (removes proximity penalty); load demos with `load_costs=True`; build chunk transitions with costs; create `CostReplayBuffer` + `SafeTQC` model; inject LayerNorm into both reward and cost critics; copy feature extractor to both critics; train with `SafeTrainingCallback`.
 
 ### Compatibility
-- `inject_layernorm_into_critics`: Skipped for CrossQ (BatchRenorm built-in); operates on critic nets for TQC/SAC
-- Replay buffer: Uses chunk-level transitions (obs, k*2 action, R_chunk, next_obs, done)
-- `--resume`: Works — SB3 pickles `features_extractor_class`; chunk_size auto-detected from action_dim
+- `--resume`: SB3 pickles `features_extractor_class`; chunk_size auto-detected from action_dim
 - `eval_policy.py`: Auto-detects CrossQ/TQC/SAC/PPO, chunk_size, and n_frames from model spaces
-- **CrossQ + SafeTQC**: Joint forward pass concatenates `[obs, next_obs]` (2*B batch) through critic so BatchRenorm sees the mixture distribution; cost critic has its own target network (independent of base algorithm); `_set_bn_mode()` toggles BatchRenorm training mode; actor updates gated by `policy_delay`
-- **CrossQ + DualPolicy**: Joint forward pass concatenates `[obs, next_obs, next_obs]` (3*B batch) for IBRL current/RL/IL Q-values; `_set_bn_mode()` + `policy_delay` gating; polyak update guarded
-- **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric layout on load via `convert_obs_to_egocentric()` in `demo_utils.py`; reads `arena_size` from demo metadata for correct workspace bounds normalization
+- **Demo format**: Old demos (pre-OBS_VERSION=2) auto-converted to ego-centric via `convert_obs_to_egocentric()` in `demo_utils.py`; reads `arena_size` from demo metadata
 
 ## Training Diagnostics
 
@@ -477,72 +352,36 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 
 ### Console Output Format
 
-**Every 100 steps:**
 ```
 [DEBUG] step=   1000 | elapsed=102.9s | rate=9.7 steps/s | episodes=4 | policy_std=[0.1469] | ent=0.00656
-```
-
-**Every 500 steps (Q-value and buffer probe):**
-```
 [DIAG]  step=   500 | Q_pi=[+8.2, +12.3, +15.1] | H=-6.42 | buf=500/1000000 demos=189394
-```
-- `Q_pi=[min, mean, max]` — critic's value estimate under current policy (watch for overestimation)
-- `H` — policy entropy (should be near target_entropy, not collapsing toward -inf)
-- `buf` — online buffer fill / capacity + demo count
-
-**Every episode end:**
-```
 [EP   30 END]    SUCCESS | steps=299 | return=+180.76 | min_lidar=0.090m | gd=0.45m | act=[0.15,0.42] | running SR=3.3% (1S/15C/14T) | t=865s
-```
-- `gd` — goal distance at episode end (close but timing out? or wandering?)
-- `act=[lin,ang]` — mean |linear_vel|, mean |angular_vel| (is agent moving? spinning in circles?)
-
-**Every 20 episodes (rolling summary):**
-```
 [SUMMARY @EP   20] last20: SR=5% CR=60% | ret=+65.3±40.2 | len=280 | goal_dist=2.10m | min_lid=0.120m
 ```
+Key fields: `Q_pi=[min,mean,max]` (critic estimate), `H` (entropy, should be near target), `gd` (goal distance at end), `act=[lin,ang]` (mean velocities).
 
 ### TensorBoard Metrics
 
-| Metric | Source | What it reveals |
-|--------|--------|----------------|
-| `diag/Q_pi_mean` | Callback | Critic value estimate — overestimation? |
-| `diag/Q_pi_min`, `diag/Q_pi_max` | Callback | Q-value spread |
-| `diag/policy_entropy` | Callback | Exploration level |
-| `diag/buffer_online` | Callback | Online data accumulation |
-| `rollout/ep_return` | Callback | Per-episode return |
-| `rollout/ep_goal_dist` | Callback | Goal distance at episode end |
-| `rollout/ep_min_lidar` | Callback | Closest obstacle approach |
-| `rollout/return_20ep` | Callback | Rolling mean return (last 20 eps) |
-| `rollout/sr_20ep` | Callback | Rolling success rate (last 20 eps) |
-| `train/target_q_mean` | SafeTQC | Mean TD target (what critic learns toward) |
-| `train/current_q_mean` | SafeTQC | Mean current Q estimate |
-| `train/batch_reward_mean` | SafeTQC | Mean reward in sampled batch (demo/online mix) |
-| `train/batch_action_mag` | SafeTQC | Mean |action| in batch |
-| `timing/grad_total_ms` | CrossQ + SafeTQC | Wall time per gradient step (ms) |
-| `timing/grad_critic_ms` | SafeTQC only | Critic forward+backward time (ms) |
-| `timing/grad_actor_ms` | SafeTQC only | Actor forward+backward time (ms, when policy_delay fires) |
-| `diag/mean_mu_abs` | Callback | Mean \|pre-tanh mean\| (>2.0 = tanh saturation risk) |
-| `diag/ent_coef` | Callback | Current entropy coefficient value |
-| `train/mean_mu_abs` | SafeTQC | Mean \|pre-tanh mean\| from last gradient step |
-| `train/mean_reg_loss` | SafeTQC | L2 regularization loss on pre-tanh means |
+| Metric | Description |
+|--------|-------------|
+| `diag/Q_pi_mean`, `_min`, `_max` | Critic value estimate and spread |
+| `diag/policy_entropy` | Exploration level |
+| `diag/mean_mu_abs` | Pre-tanh mean magnitude (>2.0 = saturation risk) |
+| `diag/ent_coef` | Current entropy coefficient |
+| `rollout/ep_return`, `ep_goal_dist`, `ep_min_lidar` | Per-episode metrics |
+| `rollout/return_20ep`, `sr_20ep` | Rolling 20-episode averages |
+| `train/target_q_mean`, `current_q_mean` | TD target vs current Q (SafeTQC) |
+| `train/mean_mu_abs`, `mean_reg_loss` | Stability diagnostics (SafeTQC) |
+| `timing/grad_total_ms`, `grad_critic_ms`, `grad_actor_ms` | Gradient step wall time |
 
 ### Step-Timing Console Output (`[TIMING]` lines)
 
 ```
 [TIMING] world.step(): 1.13ms avg (1000 calls)
 [TIMING] ChunkedWrapper.step(): total=13.8ms | inner env.step()=2.8ms avg | overhead=0.0ms (chunk_size=5, n=500)
-# Plain CrossQ (via _create_timed_cls wrapper):
-[TIMING] gradient step: total=23.3ms avg (1000 grad steps)
-# SafeTQC (detailed critic/actor split):
-[TIMING] gradient step: total=43.1ms | critic=38.4ms | actor=4.2ms | other(sample+lagrange+polyak)=0.5ms
+[TIMING] gradient step: total=23.3ms avg (1000 grad steps)          # CrossQ
+[TIMING] gradient step: total=43.1ms | critic=38.4ms | actor=4.2ms  # SafeTQC
 ```
-- `world.step()` prints every 1000 physics calls; `ChunkedWrapper` every 500 wrapper steps; gradient every 1000 gradient steps
-- `inner env.step()` = physics + obs build + reward; `overhead` = Python loop cost (typically ≈0)
-- Plain CrossQ timing: total only (no critic/actor split) — `_create_timed_cls` wraps `super().train()`
-- SafeTQC timing: critic/actor split; `other` = buffer sampling + Lagrange update + polyak copy
-- **Caution**: `_time.perf_counter()` in `SafeTQC.train()` uses a local `import time as _t` — module-level `_time` does NOT resolve inside inner classes defined in closures
-- **Caution**: Isaac Sim's Python console uses **cp1252** encoding — Unicode characters like `→` (U+2192) in `print()` cause `UnicodeEncodeError`. Use ASCII `->` in all print statements
 
 ### What to Look For When Debugging
 
@@ -564,10 +403,9 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 ## Known Pitfalls & Fixes
 
 ### target_entropy for Chunked Actions
-- **Wrong:** `target_entropy="auto"` -> SB3 computes `-dim(A)` = `-chunk_size*2` (e.g., -20 for chunk_size=10). This is too aggressive for correlated chunked actions and causes entropy death spiral.
-- **Better:** `target_entropy=-chunk_size` (e.g., -10 for chunk_size=10). Matches RLPD's `-dim(A)/2` heuristic.
-- **Problem:** For tanh-squashed 20D actions with std~0.6, actual entropy is ~+10 nats (pre-tanh Gaussian ~+18 nats, tanh correction ~-7 nats). A target of -10 is 20 nats below actual entropy, permanently pinning ent_coef at the floor. The policy effectively trains with zero entropy regularization.
-- **Recommended:** Use `--target-entropy 0` (conservative) or `--target-entropy 5` (moderate exploration). This gives the auto-tuner a reachable equilibrium where it can increase or decrease ent_coef based on policy behavior.
+- **Never** use `target_entropy="auto"` (SB3 gives `-chunk_size*2`, causes entropy death spiral)
+- Default `-chunk_size` is still unreachable for tanh-squashed chunked actions (actual H~+10 nats)
+- **Recommended:** `--target-entropy 0` (conservative) or `--target-entropy 5` (moderate exploration)
 
 ### Demo Observation v1→v2 Conversion and Arena Size
 - Old demos (OBS_VERSION=1) are auto-converted to ego-centric layout (v2) on load
@@ -583,73 +421,25 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 ### Isaac Sim Console Encoding (cp1252)
 Isaac Sim's Python process uses **Windows cp1252** encoding for stdout/stderr. Unicode characters like `→` (U+2192), `±`, `×` in `print()` cause a fatal `UnicodeEncodeError: 'charmap' codec can't encode character` that crashes training immediately. Use ASCII equivalents (`->`, `+/-`, `x`) in all print statements inside scripts run via `run.bat`.
 
-### Corrupted Checkpoint + Large ent_coef Jump → Actor NaN
-Checkpoints saved during unstable training (Q_pi ±20 oscillation, entropy collapse) may contain near-overflow weights. Resuming from such a checkpoint with a large `--ent-coef-init` jump amplifies the gradient and can push the actor to NaN within ~200 gradient steps:
-
-- **Root cause**: Old checkpoint ent_coef ≈ 0.002 → reset to 0.1 = **68× jump**. Actor entropy gradient suddenly dominates; corrupted critic Q-values produce large actor gradients; NaN in `mean_actions` (loc) after <200 steps.
-- **Symptom**: `ValueError: Expected parameter loc ... found invalid values: tensor([[nan, ...]])` early in training.
-- **Fix**: Use an earlier, cleaner checkpoint (before instability) OR reduce `--ent-coef-init 0.01` (2.5× jump instead of 68×). Prefer the cleaner checkpoint — corrupted critic weights can cause instability even with a gentle jump.
-- **Detection**: `policy_std` rising then sudden NaN = gradient explosion. `policy_std` stable but oscillating Q_pi = critic corruption without NaN (safer, may recover).
+### Corrupted Checkpoint + Large ent_coef Jump -> Actor NaN
+- Resuming from unstable checkpoint with large `--ent-coef-init` jump can cause NaN in actor within ~200 steps
+- **Symptom**: `ValueError: Expected parameter loc ... found invalid values: tensor([[nan, ...]])`
+- **Fix**: Use a cleaner checkpoint or reduce `--ent-coef-init` (e.g., 0.01 instead of 0.1)
 
 ### Tanh Saturation and Pre-Tanh Mean Explosion
-After 450k+ steps with a 20D chunked action space, the policy can learn large pre-tanh means (|mu| > 1.7) that saturate tanh (tanh(1.7) = 0.94), making the policy near-deterministic regardless of `log_std`. SB3 has no mean clamping (original Haarnoja SAC had L2 reg, SB3 dropped it), `LOG_STD_MIN = -20` (exp(-20) ~ 0) provides no protection, and `log_ent_coef` is unbounded.
-
-**Stability system (all on by default):**
-- `--mean-clamp 3.0` — Clamps |pre-tanh mean| (tanh(3)=0.995, still full range but prevents runaway)
-- `--mean-reg 0.001` — L2 penalty on pre-tanh means (keeps means small, like original SAC)
-- `--log-std-min -5.0` — Floors log_std at -5 instead of SB3's -20 (exp(-5)=0.007 vs exp(-20)~0)
-- `--ent-coef-min 0.005` — Floors ent_coef to prevent entropy death spiral
-- `--no-backup-entropy` — (Optional) Removes entropy from TD target to reduce Q instability
-
-**Diagnostics to watch:**
-- `|mu|` in `[DEBUG]` and `[DIAG]` lines — should stay < 2.0; > 3.0 = saturation
-- `train/mean_mu_abs` in TensorBoard — trend should be stable, not monotonically increasing
-- `diag/ent_coef` — should stay >= 0.005 (floor); if oscillating near floor, consider `--ent-coef-min 0.01`
-
-### CVAE Beta Selection
-- `--cvae-beta 0.1` (default) works well for deterministic demos
-- `--cvae-beta 10` causes immediate KL collapse (36x KL dominance over reconstruction)
-- For multi-modal demos, higher beta (1.0-10.0) with larger encoder is needed (ACT paper uses beta=10)
-- **Lower beta does NOT prevent collapse** — it makes collapse worse by reducing pressure on encoder
+Large pre-tanh means (|mu| > 1.7) saturate tanh, making the policy near-deterministic. The **stability system** (all on by default) prevents this: `--mean-clamp 3.0`, `--mean-reg 0.001`, `--log-std-min -5.0`, `--ent-coef-min 0.005`. Watch `diag/mean_mu_abs` in TensorBoard — should stay < 2.0.
 
 ### Reward Hierarchy Design
-The reward constants are tuned to maintain a clear penalty hierarchy:
-- **Collision (-25)** >> **max proximity accumulation (~-10/episode)** >> **time penalty (-10 over 2000 sub-steps)**
-- Without this hierarchy, proximity penalty can accumulate to -20+/episode — worse than collision (-10), making the agent prefer crashing over cautious navigation
-- The **approach bonus** (potential-based, SCALE=10.0, RADIUS=1.0m) smooths the "success cliff": without it, an agent at gd=0.26m gets -6.65 while gd=0.15m gets +49 — a 55-point cliff that's hard for the critic to model. With it, gd=0.26m gets ~+1, gd=0.15m gets ~+57 — much smoother gradient
-- Potential-based shaping (Ng et al., 1999) is provably unexploitable: orbiting at fixed distance gives 0, oscillating in/out cancels. Only net approach toward goal yields reward
-- **Heading bonus (0.5)** is gated by forward progress (`prev_dist > curr_dist`), so it's proportional to `progress * alignment` — can't be exploited by slow creeping or circling
+- **Collision (-25)** >> **max proximity (~-10/ep)** >> **time penalty (-10 over 2000 sub-steps)**
+- **Approach bonus** (potential-based, SCALE=10.0, RADIUS=1.0m) smooths the success cliff near goal. Provably unexploitable (Ng et al., 1999)
+- **Heading bonus** (0.5) gated by forward progress — can't be exploited by circling
 
-### CVAE Entropy Death Spiral + Q Instability (Critical)
+### CVAE Entropy Death Spiral + Q Instability
+CVAE pretraining sets low `log_std` (std=0.135) and `ent_coef` (~0.006), making the entropy bonus negligible vs Q-values. Without the stability system, the actor ignores entropy, makes sharp greedy updates, and Q oscillates +-20 in 3000 steps.
 
-**Root cause (confirmed via instrumentation, 2026-02-25):**
+**Fix (now default):** Stability system (`--mean-clamp 3.0 --log-std-min -5.0 --ent-coef-min 0.005`) plus `--ent-coef-init 0.1` and `--log-std-init` reset after CVAE/resume. Pass `--log-std-init -2.0` or `--ent-coef-init 0` to keep checkpoint values.
 
-CVAE pretraining sets `log_std.bias = -2.0` (std=0.135). For a 10D tanh-squashed policy, this puts entropy at ≈ -6 to -10 nats — already **below** `target_entropy=-chunk_size` before SAC starts. With `ent_coef_init=0.006`, the actor entropy bonus is `0.006 × (-10) = -0.06`, which is ~200× weaker than Q-values (±10–20). The actor ignores entropy entirely, making sharp greedy updates. On `--resume`, the checkpoint's collapsed ent_coef (~0.002) is restored, making the problem worse.
-
-**Without the fix, a death spiral occurs:**
-1. CVAE policy already below target entropy → SAC auto-tuner tries to increase ent_coef
-2. But ent_coef too small → entropy bonus negligible → actor stays deterministic
-3. Near-deterministic policy makes sharp Q updates → critic diverges → Q oscillates
-4. Q oscillation with no entropy regularization → ±20 Q swings in 3000 steps (observed)
-5. `ent_coef` oscillates around zero, never stabilizing
-
-**Fix (now default via stability system: `--mean-clamp 3.0 --log-std-min -5.0 --ent-coef-min 0.005`):**
-- Reset `log_std.bias` from -2.0 → -0.5 (std 0.135 → 0.61) after CVAE: preserves learned action means, gives SAC room to tune variance
-- Reset `ent_coef` from 0.006 → 0.1 after CVAE or on resume: entropy bonus `0.1 × (-10) = -1.0` is now non-trivial vs Q-values
-- Both resets now apply on `--resume` as well as fresh start: checkpoints may retain collapsed `log_std` (~-1.76) and `ent_coef` (~0.002) from a previous spiral; `--log-std-init -2.0` or `--ent-coef-init 0` to keep checkpoint values
-
-**Root cause for Q oscillation (separately):**
-- Post-resume distribution shock: BatchRenorm running stats calibrated at checkpoint time see shifted distribution from new online data
-- Action chunking (k=5 → 10D action space) amplifies any critic overestimation episode
-- CrossQ three-distribution mixing (demo / old-online / new-online) breaks the two-distribution BatchRenorm assumption (CrossQ paper only analyzes two distributions)
-- Fix: `--ent-coef-init 0.1` breaks the death spiral; a 5k-step frozen-actor warmup after resume would further stabilize BatchRenorm stats
-
-**Healthy post-fix signs:**
-- `policy_std` slowly rising 0.61 → 0.65+ over first 5k steps
-- `ent_coef` starting ~0.1, gently adjusting toward equilibrium
-- `Q_pi` varying ≤ ±5 units over 1000 steps (not ±20)
-
-**References:** RLPD (Ball et al., ICML 2023), CrossQ (Bhatt et al., ICLR 2024), "Understanding Q-Value Divergence in Offline-RL" (Zheng et al., NeurIPS 2023), "Scaling CrossQ with Weight Normalization" (Palo et al., arXiv 2506.03758)
+**Healthy signs:** `policy_std` slowly rising over first 5k steps, `ent_coef` ~0.1 gently adjusting, `Q_pi` varying <= +-5 per 1000 steps.
 
 ## Testing
 
