@@ -671,6 +671,8 @@ class TestStep:
             env._current_angular_vel = 0.0
             env.add_prev_action = False
             env._prev_action = np.zeros(2, dtype=np.float32)
+            env._wstep_ms_acc = 0.0
+            env._wstep_n = 0
 
             env.MAX_LINEAR_VELOCITY = 0.3
             env.MAX_ANGULAR_VELOCITY = 1.0

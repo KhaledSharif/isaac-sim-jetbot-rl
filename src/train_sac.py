@@ -620,6 +620,56 @@ def _apply_gru_lr(model, gru_lr):
     print(f"GRU learning rate applied: gru_lr={gru_lr}, base_lr={base_lr}")
 
 
+def _patch_actor_for_stability(actor, mean_clamp=3.0, log_std_min=-5.0):
+    """Monkey-patch actor.get_action_dist_params() for training stability.
+
+    Addresses two failure modes in SAC with tanh-squashed policies:
+    1. Pre-tanh mean explosion: |mu| > 2 saturates tanh, making policy
+       near-deterministic regardless of log_std. SB3 has no mean clamping
+       (original Haarnoja SAC had L2 reg, SB3 dropped it).
+    2. log_std collapse: SB3's LOG_STD_MIN=-20 provides no protection
+       (exp(-20) ~ 0). CleanRL uses -5.
+
+    Patches:
+    - Clamps pre-tanh means to [-mean_clamp, mean_clamp]
+    - Re-clamps log_std to [log_std_min, 2.0]
+    - Stores actor._last_mean_actions for diagnostics and mean regularization
+
+    Args:
+        actor: SB3 actor module
+        mean_clamp: Max |pre-tanh mean| (0 = disable clamping)
+        log_std_min: Minimum log_std floor (SB3 default: -20)
+    """
+    import types
+    import torch
+
+    if getattr(actor, '_stability_patched', False):
+        return
+
+    _orig_get_action_dist_params = actor.get_action_dist_params
+
+    def _patched_get_action_dist_params(self, obs):
+        mean_actions, log_std, kwargs = _orig_get_action_dist_params(obs)
+
+        # Clamp pre-tanh means (keep grad via clamp, not detach)
+        if mean_clamp > 0:
+            mean_actions = torch.clamp(mean_actions, -mean_clamp, mean_clamp)
+
+        # Re-clamp log_std with tighter floor
+        log_std = torch.clamp(log_std, log_std_min, 2.0)
+
+        # Store for diagnostics + mean regularization (keeps grad)
+        self._last_mean_actions = mean_actions
+
+        return mean_actions, log_std, kwargs
+
+    actor.get_action_dist_params = types.MethodType(
+        _patched_get_action_dist_params, actor)
+    actor._stability_patched = True
+    actor._last_mean_actions = None
+    print(f"  Actor patched: mean_clamp={mean_clamp}, log_std_min={log_std_min}")
+
+
 def _inject_layernorm_cost_critic(model):
     """Inject LayerNorm + OFN into cost critic networks and re-sync target."""
     import torch
@@ -920,15 +970,17 @@ def _create_safe_tqc_class(tqc_base_cls):
 
                 if is_crossq:
                     # CrossQ joint forward pass: BatchRenorm sees obs+next_obs mixture
+                    _backup_ent = getattr(self, '_backup_entropy', True)
                     with torch.no_grad():
                         next_q_target = torch.min(
                             torch.cat(self.critic(
                                 replay_data.next_observations, next_actions
                             ), dim=1), dim=1, keepdim=True
                         )[0]
+                        _ent_backup = ent_coef * next_log_prob if _backup_ent else 0.0
                         target_q = replay_data.rewards + (
                             1 - replay_data.dones
-                        ) * self.gamma * (next_q_target.detach() - ent_coef * next_log_prob)
+                        ) * self.gamma * (next_q_target.detach() - _ent_backup)
 
                     all_obs = torch.cat([replay_data.observations, replay_data.next_observations], dim=0)
                     all_actions = torch.cat([replay_data.actions, next_actions], dim=0)
@@ -988,9 +1040,11 @@ def _create_safe_tqc_class(tqc_base_cls):
                             else:
                                 next_q = next_q_values
 
+                        _backup_ent = getattr(self, '_backup_entropy', True)
+                        _ent_backup = ent_coef * next_log_prob if _backup_ent else 0.0
                         target_q = replay_data.rewards + (
                             1 - replay_data.dones
-                        ) * self.gamma * (next_q - ent_coef * next_log_prob)
+                        ) * self.gamma * (next_q - _ent_backup)
 
                     # Current Q-values
                     _qc = _get_tqc_quantile_critics(self.critic)
@@ -1107,6 +1161,12 @@ def _create_safe_tqc_class(tqc_base_cls):
                     ent_coef_loss.backward()
                     self.ent_coef_optimizer.step()
 
+                    # ent_coef floor: prevent entropy death spiral
+                    _ent_min = getattr(self, '_ent_coef_min', 0.0)
+                    if _ent_min > 0:
+                        import math as _math
+                        self.log_ent_coef.data.clamp_(min=_math.log(_ent_min))
+
                     # Q-values for current actions
                     _qc_actor = _get_tqc_quantile_critics(self.critic)
                     if is_crossq:
@@ -1149,6 +1209,12 @@ def _create_safe_tqc_class(tqc_base_cls):
                         actor_loss = (ent_coef * log_prob - qf_pi + lagrange * qc_pi).mean()
                     else:
                         actor_loss = (ent_coef * log_prob - qf_pi).mean()
+
+                    # Mean regularization: penalize large pre-tanh means
+                    _mr = getattr(self, '_mean_reg', 0.0)
+                    if _mr > 0 and getattr(self.actor, '_last_mean_actions', None) is not None:
+                        _mr_loss = _mr * self.actor._last_mean_actions.pow(2).mean()
+                        actor_loss = actor_loss + _mr_loss
 
                     actor_losses.append(actor_loss.item())
 
@@ -1230,6 +1296,15 @@ def _create_safe_tqc_class(tqc_base_cls):
             if _diag_batch_action_mag:
                 self.logger.record("train/batch_action_mag",
                                    np.mean(_diag_batch_action_mag))
+            # Pre-tanh mean magnitude and mean regularization loss
+            _last_mu = getattr(self.actor, '_last_mean_actions', None)
+            if _last_mu is not None:
+                _mu_abs = _last_mu.detach().abs().mean().item()
+                self.logger.record("train/mean_mu_abs", _mu_abs)
+                _mr = getattr(self, '_mean_reg', 0.0)
+                if _mr > 0:
+                    self.logger.record("train/mean_reg_loss",
+                                       _mr * _last_mu.detach().pow(2).mean().item())
 
         def _get_torch_save_params(self):
             state_dicts, saved_vars = super()._get_torch_save_params()
@@ -1617,6 +1692,12 @@ def _create_dual_policy_class(base_cls):
                     ent_coef_loss.backward()
                     self.ent_coef_optimizer.step()
 
+                    # ent_coef floor: prevent entropy death spiral
+                    _ent_min = getattr(self, '_ent_coef_min', 0.0)
+                    if _ent_min > 0:
+                        import math as _math
+                        self.log_ent_coef.data.clamp_(min=_math.log(_ent_min))
+
                     # Q-values for current actions
                     _qc_actor = _get_tqc_quantile_critics(self.critic)
                     if is_crossq:
@@ -1646,6 +1727,13 @@ def _create_dual_policy_class(base_cls):
                             qf_pi = q_pi_raw
 
                     actor_loss = (ent_coef * log_prob - qf_pi).mean()
+
+                    # Mean regularization: penalize large pre-tanh means
+                    _mr = getattr(self, '_mean_reg', 0.0)
+                    if _mr > 0 and getattr(self.actor, '_last_mean_actions', None) is not None:
+                        _mr_loss = _mr * self.actor._last_mean_actions.pow(2).mean()
+                        actor_loss = actor_loss + _mr_loss
+
                     actor_losses.append(actor_loss.item())
 
                     self.actor.optimizer.zero_grad()
@@ -1772,10 +1860,13 @@ Examples:
                         help='Actor update delay (default: 1; CrossQ paper uses 20 with UTD=20)')
     parser.add_argument('--ent-coef', type=str, default='auto_0.006',
                         help='Entropy coefficient, "auto" or "auto_<init>" for learned (default: auto_0.006)')
-    parser.add_argument('--log-std-init', type=float, default=-0.5,
-                        help='Actor log_std after CVAE pretraining. CVAE sets -2.0 (std=0.135) which '
-                             'collapses SAC entropy. -0.5 (std=0.61) gives SAC room to explore. '
-                             'Only applies on fresh start, not --resume. (default: -0.5)')
+    parser.add_argument('--log-std-init', type=float, default=-2.0,
+                        help='Actor log_std to set after CVAE pretraining or on --resume. '
+                             '-2.0 (default) keeps the CVAE/checkpoint value; the new stability '
+                             'fixes (--mean-clamp, --log-std-min, --ent-coef-min) prevent entropy '
+                             'collapse without inflating log_std. Pass -0.5 (std=0.61) for the '
+                             'old behavior of boosting exploration noise. '
+                             '(default: -2.0 = keep CVAE/checkpoint value)')
     parser.add_argument('--ent-coef-init', type=float, default=0.1,
                         help='ent_coef value to set after CVAE pretraining or on resume. '
                              'CVAE leaves ent_coef too small (~0.006) giving negligible entropy '
@@ -1805,6 +1896,26 @@ Examples:
                         help='GRU hidden dimension (only used when --n-frames > 1, default: 128)')
     parser.add_argument('--gru-lr', type=float, default=1e-5,
                         help='GRU learning rate (only used when --n-frames > 1, default: 1e-5)')
+
+    # Actor stability arguments
+    stab_group = parser.add_argument_group('Actor stability')
+    stab_group.add_argument('--mean-clamp', type=float, default=3.0,
+                            help='Clamp |pre-tanh mean| to this value (0=disable). '
+                                 'Prevents tanh saturation (tanh(3)=0.995). (default: 3.0)')
+    stab_group.add_argument('--mean-reg', type=float, default=0.001,
+                            help='L2 regularization weight on pre-tanh means (0=disable). '
+                                 'Penalizes large means to keep actions away from tanh saturation. '
+                                 '(default: 0.001)')
+    stab_group.add_argument('--log-std-min', type=float, default=-5.0,
+                            help='Minimum log_std floor (SB3 default: -20, CleanRL: -5). '
+                                 'exp(-5)=0.007 prevents near-zero std. (default: -5.0)')
+    stab_group.add_argument('--ent-coef-min', type=float, default=0.005,
+                            help='Floor for ent_coef (0=disable). Prevents entropy death spiral '
+                                 'by clamping log_ent_coef >= log(ent_coef_min). (default: 0.005)')
+    stab_group.add_argument('--no-backup-entropy', action='store_true',
+                            help='Remove entropy term from TD target (RLPD-style). '
+                                 'Reduces entropy-driven Q instability at the cost of slightly '
+                                 'less exploration incentive.')
 
     # Environment arguments
     parser.add_argument('--reward-mode', choices=['dense', 'sparse'], default='dense',
@@ -1937,6 +2048,19 @@ Examples:
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback, BaseCallback
     from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
     from demo_utils import make_chunk_transitions
+
+    # If resuming, peek at checkpoint to resolve chunk_size BEFORE creating the env.
+    # The env is built with args.chunk_size, so we must reconcile any mismatch early.
+    if args.resume:
+        from stable_baselines3.common.save_util import load_from_zip_file as _peek_zip
+        _peek_data, _, _ = _peek_zip(args.resume, device="cpu")
+        _ckpt_action_space = _peek_data.get("action_space", None)
+        if _ckpt_action_space is not None:
+            _ckpt_chunk = _ckpt_action_space.shape[0] // 2
+            if _ckpt_chunk != args.chunk_size:
+                print(f"  [Resume] Checkpoint chunk_size={_ckpt_chunk} overrides --chunk-size={args.chunk_size}")
+                args.chunk_size = _ckpt_chunk
+        del _peek_zip, _peek_data, _ckpt_action_space
 
     # Algorithm selection: CrossQ (default) > TQC (--legacy-tqc) > SAC (fallback)
     if args.legacy_tqc:
@@ -2185,11 +2309,13 @@ Examples:
                 attr = recursive_getattr(model, name)
                 attr.data = val
                 print(f"  Restored variable: {name}")
-        # Verify chunk size matches
+        # Verify chunk size matches (should already match after early reconciliation above)
         loaded_chunk = model.action_space.shape[0] // 2
         if loaded_chunk != args.chunk_size:
-            print(f"  Warning: loaded model chunk_size={loaded_chunk} != --chunk-size={args.chunk_size}")
-            print(f"  Using loaded chunk_size={loaded_chunk}")
+            raise RuntimeError(
+                f"Chunk size mismatch after resume: model={loaded_chunk}, env={args.chunk_size}. "
+                f"This should not happen — please report a bug."
+            )
         # Auto-detect n_frames from loaded model obs space
         loaded_obs_dim = model.observation_space.shape[0]
         if loaded_obs_dim > 34 and args.n_frames == 1:
@@ -2204,16 +2330,37 @@ Examples:
             model.tau = args.tau
         model.gradient_steps = args.utd_ratio
         model.ent_coef = ent_coef
-        # On resume: the checkpoint may have a collapsed ent_coef (~0.002) from a previous
-        # entropy death spiral. Explicitly reset if --ent-coef-init > 0.
+        # On resume: the checkpoint may have collapsed ent_coef (~0.002) and/or
+        # collapsed log_std (~-1.76) from a previous entropy death spiral.
+        # Reset both if the corresponding flags are set.
+        import math as _math
+        import torch as _torch
+        if args.log_std_init != -2.0:  # -2.0 = keep checkpoint value
+            ls = model.actor.log_std
+            old_std = float(ls.bias.data.mean().exp()) if hasattr(ls, 'bias') else float(ls.data.mean().exp())
+            with _torch.no_grad():
+                if hasattr(ls, 'bias'):
+                    ls.bias.data.fill_(args.log_std_init)
+                    ls.weight.data.zero_()
+                else:
+                    ls.data.fill_(args.log_std_init)
+            print(f"  log_std reset on resume: {_math.log(old_std):.3f} -> {args.log_std_init:.2f} "
+                  f"(std {old_std:.3f} -> {_math.exp(args.log_std_init):.3f})  "
+                  f"[pass --log-std-init -2.0 to keep checkpoint value]")
         if args.ent_coef_init > 0 and hasattr(model, 'log_ent_coef'):
-            import math as _math
-            import torch as _torch
             old_val = float(model.log_ent_coef.exp())
             with _torch.no_grad():
                 model.log_ent_coef.data.fill_(_math.log(args.ent_coef_init))
             print(f"  ent_coef reset on resume: {old_val:.5f} -> {args.ent_coef_init:.4f}  "
                   f"[pass --ent-coef-init 0 to keep checkpoint value]")
+        # Actor stability fixes
+        model._mean_reg = args.mean_reg
+        model._ent_coef_min = args.ent_coef_min
+        model._backup_entropy = not args.no_backup_entropy
+        _patch_actor_for_stability(model.actor, args.mean_clamp, args.log_std_min)
+        print(f"  Stability: mean_clamp={args.mean_clamp}, mean_reg={args.mean_reg}, "
+              f"log_std_min={args.log_std_min}, ent_coef_min={args.ent_coef_min}, "
+              f"backup_entropy={not args.no_backup_entropy}")
         # Replace replay buffer with fresh demo buffer (online data is lost)
         model.replay_buffer = replay_buffer
         # Force initial env.reset() — __dict__.update(data) restores a stale
@@ -2319,9 +2466,9 @@ Examples:
                     ls.weight.data.zero_()
                 else:
                     ls.data.fill_(args.log_std_init)
-            print(f"  log_std reset: -2.0 -> {args.log_std_init:.2f} "
-                  f"(std {_math.exp(-2.0):.3f} -> {_math.exp(args.log_std_init):.3f}) "
-                  f"  [pass --log-std-init -2.0 to keep CVAE value]")
+            print(f"  log_std reset: -2.00 -> {args.log_std_init:.2f} "
+                  f"(std 0.135 -> {_math.exp(args.log_std_init):.3f})  "
+                  f"[pass --log-std-init -2.0 to keep CVAE value]")
 
         if args.ent_coef_init > 0 and hasattr(model, 'log_ent_coef'):
             with _torch.no_grad():
@@ -2329,6 +2476,15 @@ Examples:
             print(f"  ent_coef reset: 0.006 -> {args.ent_coef_init:.4f} "
                   f"(log_ent_coef={_math.log(args.ent_coef_init):.2f})  "
                   f"[pass --ent-coef-init 0 to disable]")
+
+        # Actor stability fixes
+        model._mean_reg = args.mean_reg
+        model._ent_coef_min = args.ent_coef_min
+        model._backup_entropy = not args.no_backup_entropy
+        _patch_actor_for_stability(model.actor, args.mean_clamp, args.log_std_min)
+        print(f"  Stability: mean_clamp={args.mean_clamp}, mean_reg={args.mean_reg}, "
+              f"log_std_min={args.log_std_min}, ent_coef_min={args.ent_coef_min}, "
+              f"backup_entropy={not args.no_backup_entropy}")
 
     # Freeze IL actor for dual-policy (IBRL)
     if args.dual_policy:

@@ -397,7 +397,7 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 4. Create model with `ChunkCVAEFeatureExtractor`, gamma=γ^k, target_entropy=-k (one nat per chunk step; matches RLPD's `-dim(A)/2` heuristic for correlated chunked actions; avoids entropy collapse with tanh squashing)
 5. Inject LayerNorm into critics (`inject_layernorm_into_critics()`) — skipped for CrossQ (BatchRenorm built-in)
 6. `pretrain_chunk_cvae()` — trains feature extractor + actor on demo chunks via CVAE
-7. **Reset `log_std` and `ent_coef` after CVAE** (critical — see entropy pitfall below): CVAE sets `log_std.bias=-2.0` (std=0.135) and `ent_coef_init=0.006`. This collapses entropy below `target_entropy` before SAC starts. Reset `log_std` to -0.5 and `ent_coef` to 0.1 via `--log-std-init -0.5 --ent-coef-init 0.1` (now default).
+7. **Reset `log_std` and `ent_coef` after CVAE** (critical — see entropy pitfall below): CVAE sets `log_std.bias=-2.0` (std=0.135) and `ent_coef_init=0.006`. The new stability system (`--mean-clamp`, `--log-std-min`, `--ent-coef-min`) prevents entropy collapse without requiring log_std inflation. Pass `--log-std-init -0.5` for the old behavior of boosting exploration noise.
 8. Copy pretrained feature extractor weights → critic (and critic_target if present; CrossQ has none)
 9. Train with CrossQ/TQC/SAC (no auxiliary callback needed — CVAE encoder is discarded)
 
@@ -405,6 +405,7 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 - **symlog()**: DreamerV3 symmetric log compression
 - **_set_bn_mode()**: Toggle BatchRenorm training mode if supported (CrossQ only; no-op for TQC/SAC)
 - **_create_timed_cls()**: Wraps any SB3 algo class with a `train()` override that measures total gradient step wall time; applied unconditionally before `--safe`/`--dual-policy` wrapping; SafeTQC/DualPolicy override `train()` and keep their own detailed timing
+- **_patch_actor_for_stability()**: Monkey-patches `actor.get_action_dist_params()` to clamp pre-tanh means (`--mean-clamp`), floor log_std (`--log-std-min`), and store `_last_mean_actions` for diagnostics/regularization. Guards against double-patching via `_stability_patched` flag.
 - **ChunkCVAEFeatureExtractor.get_class()**: Returns SB3 BaseFeaturesExtractor with split state/lidar MLPs + z-pad
 - **TemporalCVAEFeatureExtractor.get_class()**: Returns GRU-based SB3 feature extractor for frame-stacked observations
 - **pretrain_chunk_cvae()**: CVAE pretraining on demo action chunks; trains feature extractor + actor layers
@@ -433,8 +434,13 @@ The CVAE encoder will collapse to the prior (`active_dims=0/z_dim`) when demos a
 | `--cvae-epochs` | 100 | CVAE pretraining epochs |
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
-| `--log-std-init` | -0.5 | Actor log_std after CVAE (fresh start). CVAE sets -2.0 (std=0.135) which collapses entropy before SAC starts; -0.5 (std=0.61) gives SAC room to explore. Use -2.0 to keep CVAE value. |
+| `--log-std-init` | -2.0 | Actor log_std after CVAE or on `--resume`. -2.0 = keep CVAE/checkpoint value (new stability fixes handle entropy). Pass -0.5 for old behavior of boosting exploration noise. |
 | `--ent-coef-init` | 0.1 | ent_coef to set after CVAE pretraining or on resume. CVAE/checkpoint may leave ent_coef near 0.006 giving negligible entropy bonus vs Q-values. Applied on both fresh start and `--resume`; pass 0 to disable. |
+| `--mean-clamp` | 3.0 | Clamp \|pre-tanh mean\| (0=disable). Prevents tanh saturation (tanh(3)=0.995). |
+| `--mean-reg` | 0.001 | L2 reg weight on pre-tanh means (0=disable). Penalizes large means. |
+| `--log-std-min` | -5.0 | Minimum log_std floor (SB3 default: -20). exp(-5)=0.007 prevents near-zero std. |
+| `--ent-coef-min` | 0.005 | Floor for ent_coef (0=disable). Prevents entropy death spiral. |
+| `--no-backup-entropy` | off | Remove entropy from TD target (RLPD-style). Reduces entropy-driven Q instability. |
 | `--safe` | off | Enable SafeTQC (cost critic + Lagrange) |
 | `--cost-limit` | 25.0 | Per-episode cost budget |
 | `--lagrange-lr` | 3e-4 | Lagrange multiplier learning rate |
@@ -515,6 +521,10 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | `timing/grad_total_ms` | CrossQ + SafeTQC | Wall time per gradient step (ms) |
 | `timing/grad_critic_ms` | SafeTQC only | Critic forward+backward time (ms) |
 | `timing/grad_actor_ms` | SafeTQC only | Actor forward+backward time (ms, when policy_delay fires) |
+| `diag/mean_mu_abs` | Callback | Mean \|pre-tanh mean\| (>2.0 = tanh saturation risk) |
+| `diag/ent_coef` | Callback | Current entropy coefficient value |
+| `train/mean_mu_abs` | SafeTQC | Mean \|pre-tanh mean\| from last gradient step |
+| `train/mean_reg_loss` | SafeTQC | L2 regularization loss on pre-tanh means |
 
 ### Step-Timing Console Output (`[TIMING]` lines)
 
@@ -540,13 +550,15 @@ The `VerboseEpisodeCallback` and SafeTQC train loop provide rich diagnostics to 
 | High collision rate (>50%) | Agent ignores LiDAR | `act=[lin,ang]` — high angular = spinning; `min_lidar` pattern |
 | 0% success rate after 50k steps | Goal reward too weak or agent can't navigate | `gd` — if decreasing, agent approaches but fails; if flat, agent wanders |
 | `ent_coef` monotonically decreasing | Entropy death spiral, target_entropy too aggressive | Compare policy entropy `H` vs target_entropy; should stabilize |
-| `ent_coef` oscillating near 0.002, entropy swings ±10 nats | CVAE collapsed log_std + insufficient ent_coef_init | Add `--log-std-init -0.5 --ent-coef-init 0.1`; reset on resume too |
+| `ent_coef` oscillating near 0.002, entropy swings ±10 nats | CVAE collapsed log_std + insufficient ent_coef_init | New defaults fix this: `--ent-coef-min 0.005` floors ent_coef, `--mean-clamp 3.0` prevents tanh saturation. Optionally pass `--log-std-init -0.5 --ent-coef-init 0.1` for the old fix. |
 | Q_pi swings ±20 in 3000 steps without diverging | Entropy collapse triggering sharp actor updates + BatchRenorm distribution shock | Fix entropy first (`--ent-coef-init 0.1`); optionally freeze actor 5k steps after resume |
 | `ent_coef` monotonically increasing | Policy too deterministic | `policy_std` — if pinned near initial value, CVAE overtightened |
 | Q_pi values growing unboundedly | Critic overestimation | `train/target_q_mean` — should stabilize; if growing > 1000, problem |
 | Returns high but SR=0% | Reward exploitation (distance shaping) | Check if truncated episodes dominate; heading bonus is gated by progress |
 | Near-miss episodes (gd<0.5m) still negative returns | Approach bonus too weak or radius too small | Check `APPROACH_BONUS_SCALE` and `APPROACH_BONUS_RADIUS`; near-misses at gd=0.25m should get ~+7.5 approach bonus |
 | Proximity penalty > collision penalty | `PROXIMITY_SCALE` too high or `COLLISION_PENALTY` too low | Per-episode proximity should stay below collision magnitude; check hierarchy: collision >> proximity >> time |
+| `\|mu\|` > 2.0 in `[DEBUG]` lines | Pre-tanh mean explosion / tanh saturation | `--mean-clamp 3.0` (default) prevents runaway; `--mean-reg 0.001` adds L2 penalty; check `train/mean_mu_abs` in TensorBoard |
+| `ent_coef` pinned at floor (0.005) | Entropy wants to collapse further | Policy may be too deterministic; consider increasing `--ent-coef-min` or checking if CVAE overfitted |
 
 ## Known Pitfalls & Fixes
 
@@ -576,6 +588,21 @@ Checkpoints saved during unstable training (Q_pi ±20 oscillation, entropy colla
 - **Fix**: Use an earlier, cleaner checkpoint (before instability) OR reduce `--ent-coef-init 0.01` (2.5× jump instead of 68×). Prefer the cleaner checkpoint — corrupted critic weights can cause instability even with a gentle jump.
 - **Detection**: `policy_std` rising then sudden NaN = gradient explosion. `policy_std` stable but oscillating Q_pi = critic corruption without NaN (safer, may recover).
 
+### Tanh Saturation and Pre-Tanh Mean Explosion
+After 450k+ steps with a 20D chunked action space, the policy can learn large pre-tanh means (|mu| > 1.7) that saturate tanh (tanh(1.7) = 0.94), making the policy near-deterministic regardless of `log_std`. SB3 has no mean clamping (original Haarnoja SAC had L2 reg, SB3 dropped it), `LOG_STD_MIN = -20` (exp(-20) ~ 0) provides no protection, and `log_ent_coef` is unbounded.
+
+**Stability system (all on by default):**
+- `--mean-clamp 3.0` — Clamps |pre-tanh mean| (tanh(3)=0.995, still full range but prevents runaway)
+- `--mean-reg 0.001` — L2 penalty on pre-tanh means (keeps means small, like original SAC)
+- `--log-std-min -5.0` — Floors log_std at -5 instead of SB3's -20 (exp(-5)=0.007 vs exp(-20)~0)
+- `--ent-coef-min 0.005` — Floors ent_coef to prevent entropy death spiral
+- `--no-backup-entropy` — (Optional) Removes entropy from TD target to reduce Q instability
+
+**Diagnostics to watch:**
+- `|mu|` in `[DEBUG]` and `[DIAG]` lines — should stay < 2.0; > 3.0 = saturation
+- `train/mean_mu_abs` in TensorBoard — trend should be stable, not monotonically increasing
+- `diag/ent_coef` — should stay >= 0.005 (floor); if oscillating near floor, consider `--ent-coef-min 0.01`
+
 ### CVAE Beta Selection
 - `--cvae-beta 0.1` (default) works well for deterministic demos
 - `--cvae-beta 10` causes immediate KL collapse (36x KL dominance over reconstruction)
@@ -603,10 +630,10 @@ CVAE pretraining sets `log_std.bias = -2.0` (std=0.135). For a 10D tanh-squashed
 4. Q oscillation with no entropy regularization → ±20 Q swings in 3000 steps (observed)
 5. `ent_coef` oscillates around zero, never stabilizing
 
-**Fix (now default via `--log-std-init -0.5 --ent-coef-init 0.1`):**
+**Fix (now default via stability system: `--mean-clamp 3.0 --log-std-min -5.0 --ent-coef-min 0.005`):**
 - Reset `log_std.bias` from -2.0 → -0.5 (std 0.135 → 0.61) after CVAE: preserves learned action means, gives SAC room to tune variance
 - Reset `ent_coef` from 0.006 → 0.1 after CVAE or on resume: entropy bonus `0.1 × (-10) = -1.0` is now non-trivial vs Q-values
-- On resume: `log_ent_coef` tensor is explicitly overwritten (SB3 restores it from checkpoint otherwise)
+- Both resets now apply on `--resume` as well as fresh start: checkpoints may retain collapsed `log_std` (~-1.76) and `ent_coef` (~0.002) from a previous spiral; `--log-std-init -2.0` or `--ent-coef-init 0` to keep checkpoint values
 
 **Root cause for Q oscillation (separately):**
 - Post-resume distribution shock: BatchRenorm running stats calibrated at checkpoint time see shifted distribution from new online data

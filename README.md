@@ -257,7 +257,7 @@ ChunkCVAEFeatureExtractor (dynamic split: state_dim = obs_dim - 24):
 | `--cvae-beta` | 0.1 | CVAE KL weight |
 | `--cvae-lr` | 1e-3 | CVAE pretraining learning rate |
 | `--demo-ratio` | 0.5 | Fraction of batch from demos |
-| `--log-std-init` | -0.5 | Actor log_std after CVAE. CVAE sets -2.0 (std=0.135) collapsing entropy before SAC starts; -0.5 (std=0.61) gives SAC room to explore. Use -2.0 to keep CVAE value. |
+| `--log-std-init` | -0.5 | Actor log_std after CVAE pretraining or on `--resume`. CVAE sets -2.0 (std=0.135) collapsing entropy before SAC starts; checkpoints may retain this. -0.5 (std=0.61) gives SAC room to explore. Applied on both fresh start and `--resume`; pass -2.0 to keep CVAE/checkpoint value. |
 | `--ent-coef-init` | 0.1 | ent_coef set after CVAE pretraining and on `--resume`. CVAE/checkpoint may leave ent_coef ≈0.006 (entropy bonus negligible vs Q-values). Use 0 to disable. |
 
 #### SafeTQC: Constrained RL with Lagrange Multiplier

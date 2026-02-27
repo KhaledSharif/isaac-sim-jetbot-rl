@@ -437,6 +437,7 @@ class VerboseEpisodeCallback:
             def _on_training_start(self):
                 import time
                 self._start_time = time.time()
+                self._start_step = self.num_timesteps
                 print(f"[DEBUG] Training loop started at step {self.num_timesteps}", flush=True)
 
             def _on_step(self):
@@ -454,7 +455,8 @@ class VerboseEpisodeCallback:
                 # Periodic step-rate report
                 if total_steps - self._last_report_step >= self._report_interval:
                     elapsed = time.time() - self._start_time if self._start_time else 0
-                    rate = total_steps / elapsed if elapsed > 0 else 0
+                    session_steps = total_steps - (self._start_step if hasattr(self, '_start_step') else 0)
+                    rate = session_steps / elapsed if elapsed > 0 else 0
 
                     # Policy log_std (actual exploration noise)
                     policy_str = ""
@@ -477,12 +479,21 @@ class VerboseEpisodeCallback:
                     if hasattr(self.model, 'ent_coef_tensor'):
                         ent_str = f" | ent={self.model.ent_coef_tensor.item():.5f}"
 
+                    # Pre-tanh mean magnitude (from stability patch)
+                    mu_str = ""
+                    try:
+                        _lma = getattr(self.model.actor, '_last_mean_actions', None)
+                        if _lma is not None:
+                            mu_str = f" | |mu|={_lma.detach().abs().mean().item():.2f}"
+                    except Exception:
+                        pass
+
                     print(
                         f"[DEBUG] step={total_steps:>7d} | "
                         f"elapsed={elapsed:.1f}s | "
                         f"rate={rate:.1f} steps/s | "
                         f"episodes={self._ep_count}"
-                        f"{policy_str}{ent_str}",
+                        f"{policy_str}{ent_str}{mu_str}",
                         flush=True
                     )
                     self._last_report_step = total_steps
@@ -516,6 +527,17 @@ class VerboseEpisodeCallback:
                             n_demos = getattr(buf, 'n_demos', 0)
                             buf_cap = getattr(buf, 'buffer_size', 0)
 
+                            # Pre-tanh mean magnitude (from stability patch)
+                            _diag_mu_abs = None
+                            _lma = getattr(self.model.actor, '_last_mean_actions', None)
+                            if _lma is not None:
+                                _diag_mu_abs = _lma.detach().abs().mean().item()
+
+                            # ent_coef value
+                            _diag_ent_coef = None
+                            if hasattr(self.model, 'log_ent_coef'):
+                                _diag_ent_coef = float(self.model.log_ent_coef.exp().item())
+
                             # Log to TensorBoard
                             self.model.logger.record(
                                 "diag/Q_pi_mean", q_mean)
@@ -527,12 +549,22 @@ class VerboseEpisodeCallback:
                                 "diag/policy_entropy", entropy)
                             self.model.logger.record(
                                 "diag/buffer_online", buf_online)
+                            if _diag_mu_abs is not None:
+                                self.model.logger.record(
+                                    "diag/mean_mu_abs", _diag_mu_abs)
+                            if _diag_ent_coef is not None:
+                                self.model.logger.record(
+                                    "diag/ent_coef", _diag_ent_coef)
+
+                            # Build extra fields for console
+                            _mu_str = f" | |mu|={_diag_mu_abs:.2f}" if _diag_mu_abs is not None else ""
+                            _ec_str = f" | ent_coef={_diag_ent_coef:.5f}" if _diag_ent_coef is not None else ""
 
                             print(
                                 f"[DIAG]  step={total_steps:>7d} | "
                                 f"Q_pi=[{q_min_v:+.1f}, {q_mean:+.1f}, "
                                 f"{q_max_v:+.1f}] | "
-                                f"H={entropy:+.2f} | "
+                                f"H={entropy:+.2f}{_mu_str}{_ec_str} | "
                                 f"buf={buf_online}/{buf_cap} "
                                 f"demos={n_demos}",
                                 flush=True,
